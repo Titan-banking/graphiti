@@ -162,7 +162,7 @@ particularly suitable for applications requiring real-time interaction and preci
 Requirements:
 
 - Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon OpenSearch
+- Neo4j 5.26 / FalkorDB 1.1.2 / ArcadeDB 26.10.1+ / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon OpenSearch
   Serverless collection (serves as the full text search backend) / Kuzu 0.11.2 (**deprecated**, see below)
 - OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
 
@@ -225,6 +225,19 @@ pip install graphiti-core[kuzu]
 uv add graphiti-core[kuzu]
 ```
 
+### Installing with ArcadeDB Support
+
+If you plan to use ArcadeDB as your graph database backend, install with the ArcadeDB extra.
+ArcadeDB reuses the `neo4j` Python driver (already a core dependency) via the Bolt protocol, so no
+additional packages are needed:
+
+```bash
+pip install graphiti-core[arcadedb]
+
+# or with uv
+uv add graphiti-core[arcadedb]
+```
+
 ### Installing with Amazon Neptune Support
 
 If you plan to use Amazon Neptune as your graph database backend, install with the Amazon Neptune extra:
@@ -283,7 +296,7 @@ performance.
 For a complete working example, see the [Quickstart Example](examples/quickstart/README.md) in the examples directory.
 The quickstart demonstrates:
 
-1. Connecting to a Neo4j, Amazon Neptune, FalkorDB, or Kuzu database
+1. Connecting to a Neo4j, Amazon Neptune, FalkorDB, Kuzu, or ArcadeDB database
 2. Initializing Graphiti indices and constraints
 3. Adding episodes to the graph (both text and structured JSON)
 4. Searching for relationships (edges) using hybrid search
@@ -451,6 +464,29 @@ driver = NeptuneDriver(
     aoss_host='<AMAZON_OPENSEARCH_SERVERLESS_HOST>',
     port=8182,      # Optional, defaults to 8182
     aoss_port=443,  # Optional, defaults to 443
+)
+
+# Pass the driver to Graphiti
+graphiti = Graphiti(graph_driver=driver)
+```
+
+#### ArcadeDB
+
+ArcadeDB is reached over its Neo4j Bolt-compatible endpoint. Start the server with the Bolt plugin enabled
+(`-Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin`; Bolt listens on port 7687, HTTP/Studio on
+2480). ArcadeDB 26.10.1 or newer is required (native fulltext/vector index DDL and the 3-argument
+`db.index.fulltext.query*` procedures).
+
+```python
+from graphiti_core import Graphiti
+from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
+
+# Create an ArcadeDB driver
+driver = ArcadeDBDriver(
+    uri="bolt://localhost:7687",
+    user="root",
+    password="playwithdata",
+    database="graphiti"  # Optional, defaults to 'graphiti'
 )
 
 # Pass the driver to Graphiti
