@@ -482,17 +482,32 @@ from graphiti_core import Graphiti
 from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
 
 # Create an ArcadeDB driver
+
 driver = ArcadeDBDriver(
     uri="bolt://localhost:7687",
     user="root",
     password="playwithdata",
-    database="graphiti"  # Optional, defaults to 'graphiti'
+    database="graphiti",  # Optional, defaults to 'graphiti'
+    # Optional. Only used to create the BM25 full-text indexes, which ArcadeDB's
+    # Cypher channel cannot express. Defaults to the Bolt host on port 2480.
+    http_uri="http://localhost:2480",
 )
 
 # Pass the driver to Graphiti
 graphiti = Graphiti(graph_driver=driver)
 ```
 
+Starting the server with Bolt enabled:
+
+```bash
+docker run -d -p 2480:2480 -p 7687:7687 \
+  -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
+    -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin" \
+  arcadedata/arcadedb:latest
+```
+
+Full-text (BM25) search uses ArcadeDB's Neo4j-compatible `db.index.fulltext.*` procedures. Index DDL is
+issued by `build_indices_and_constraints()`.
 Contributing a new graph backend? See [Adding a graph driver](CONTRIBUTING.md#adding-a-graph-driver).
 
 ## Using Graphiti with Azure OpenAI
