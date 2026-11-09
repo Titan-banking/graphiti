@@ -265,7 +265,9 @@ class ArcadeDBSearchOperations(SearchOperations):
             )
             + """
             YIELD relationship AS rel, score
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+            WITH rel AS e, score, startNode(rel) AS n, endNode(rel) AS m
+            WHERE n:Entity AND m:Entity
+            WITH e, score, n, m
             """
             + filter_query
             + """

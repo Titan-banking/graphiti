@@ -214,9 +214,11 @@ async def edge_fulltext_search(
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
     """
-    if driver.provider == GraphProvider.FALKORDB:
-        # FalkorDB plans the MATCH above as a full :Entity label scan for EVERY row the
-        # fulltext index yields, so the cost is O(hits x entities). The relationship the
+    if driver.provider in (GraphProvider.FALKORDB, GraphProvider.ARCADEDB):
+        # The MATCH above costs O(hits x data) for EVERY row the fulltext index yields:
+        # FalkorDB plans it as a full :Entity label scan, and ArcadeDB resolves
+        # `{uuid: rel.uuid}` by scanning the RELATES_TO edges (its relationship property
+        # index is not used there; ~100 ms per hit at 20k edges). The relationship the
         # index already returned knows its own endpoints, so read them directly. The label
         # predicate keeps the result set identical to the pattern's.
         match_query = """
