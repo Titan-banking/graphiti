@@ -1,0 +1,27 @@
+services:
+  arcadedb:
+    image: arcadedata/arcadedb:26.12.1-SNAPSHOT
+    # The snapshot tag is mutable: always pull so the newest build is used.
+    pull_policy: always
+    container_name: arcadedb-graphiti
+    ports:
+      - "2481:2480" # HTTP / Studio
+      - "7687:7687" # Bolt
+    environment:
+      JAVA_OPTS: >-
+        -Darcadedb.server.rootPassword=playwithdata
+        -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
+        -Darcadedb.server.defaultDatabases=graphiti[root]
+        -Darcadedb.maxPageRAM=512
+        -XX:MaxRAMPercentage=75
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8g
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- --header='Authorization:Basic cm9vdDpwbGF5d2l0aGRhdGE=' http://localhost:2480/api/v1/ready >/dev/null || exit 1
+      interval: 5s
+      retries: 30

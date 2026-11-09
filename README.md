@@ -482,19 +482,21 @@ from graphiti_core import Graphiti
 from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
 
 # Create an ArcadeDB driver
-
 driver = ArcadeDBDriver(
     uri="bolt://localhost:7687",
     user="root",
     password="playwithdata",
     database="graphiti",  # Optional, defaults to 'graphiti'
-    # Optional. Only used to create the BM25 full-text indexes, which ArcadeDB's
-    # Cypher channel cannot express. Defaults to the Bolt host on port 2480.
+    # Optional. HTTP API of the same server, used to create types with a bucket count and,
+    # for a group_id that has no database yet, that database. Defaults to the Bolt host on
+    # port 2480.
     http_uri="http://localhost:2480",
+    embedding_dim=1024,  # Optional. Omit to let the vector index size itself from the first embedding.
 )
 
-# Pass the driver to Graphiti
+# Pass the driver to Graphiti, and create the indexes (ArcadeDB does not do so on connect)
 graphiti = Graphiti(graph_driver=driver)
+await graphiti.build_indices_and_constraints()
 ```
 
 Starting the server with Bolt enabled:
@@ -502,12 +504,22 @@ Starting the server with Bolt enabled:
 ```bash
 docker run -d -p 2480:2480 -p 7687:7687 \
   -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
-    -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin" \
+    -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin \
+    -Darcadedb.server.defaultDatabases=graphiti[root]" \
   arcadedata/arcadedb:latest
 ```
 
-Full-text (BM25) search uses ArcadeDB's Neo4j-compatible `db.index.fulltext.*` procedures. Index DDL is
-issued by `build_indices_and_constraints()`.
+Notes:
+
+- Full-text (BM25) search uses the `db.index.fulltext.*` procedures and node/community similarity search uses an
+  HNSW vector index (`db.index.vector.queryNodes`) with the `group_id` filter applied inside the index search.
+  Relationships have no ANN procedure, so fact similarity is scored exactly in the query. Both index kinds are
+  created by `build_indices_and_constraints()`; `use_vector_index=False` skips the vector index and scores exactly.
+- A vector index has a fixed dimension, so one database holds embeddings of one dimension only.
+- Like FalkorDB, each `group_id` is its own database: passing a `group_id` to `add_episode`/`search` creates that
+  database and its indexes on first use (this needs `http_uri`).
+- `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
+
 Contributing a new graph backend? See [Adding a graph driver](CONTRIBUTING.md#adding-a-graph-driver).
 
 ## Using Graphiti with Azure OpenAI
