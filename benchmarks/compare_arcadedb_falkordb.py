@@ -323,6 +323,10 @@ class Engine:
                 embedding_dim=self.dim,
                 use_vector_index=self.key != 'arcadedb_exact',
                 vector_quantization='scalar' if self.key == 'arcadedb_ann_scalar' else 'none',
+                # The columns measure the engine under N concurrent writers, so the driver's
+                # default of one writer at a time is switched off (its effect is measured in
+                # arcadedb_concurrent_writes.py).
+                write_concurrency=None,
             )
         await self.driver.build_indices_and_constraints()
         self.disk_base = self._du_mb()
@@ -440,6 +444,9 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
         edges = [make_edge(base + c * 1000 + i, n, dim) for i in range(q)]
         lat, wall = await run_concurrent(lambda i, edges=edges: edges[i].save(d), q, c)
         r[f'save_edge_c{c}'] = {**summarize(lat), 'per_s': q / wall}
+
+    if args.metrics == 'save':
+        return r
 
     total = q + w
     pick = [rng.randrange(n) for _ in range(total)]
@@ -724,7 +731,11 @@ async def run(args) -> dict[str, Any]:
         if args.variants and key not in args.variants:
             continue
         done = results.setdefault(key, {})
-        todo = [n for n in args.sizes if 'error' in done.get(str(n), {'error': 1})]
+        todo = (
+            list(args.sizes)
+            if args.metrics == 'save'
+            else [n for n in args.sizes if 'error' in done.get(str(n), {'error': 1})]
+        )
         if not todo:
             print(f'== {label}: all sizes already measured', flush=True)
             continue
@@ -761,8 +772,15 @@ async def run(args) -> dict[str, Any]:
                         await engine.close()
                     except Exception as e:
                         print(f'!! cleanup of {engine.name} failed: {e!r}', flush=True)
-            res['peak_mem_mib'] = mem.peak
-            done[str(n)] = res
+            if args.metrics == 'save':
+                # Every other leg is kept; only the single saves were re-measured.
+                if 'error' not in res:
+                    merged = done.setdefault(str(n), {})
+                    merged.update({k: v for k, v in res.items() if k.startswith('save_')})
+                    merged['saves_remeasured'] = dt.date.today().isoformat()
+            else:
+                res['peak_mem_mib'] = mem.peak
+                done[str(n)] = res
             state_file.write_text(json.dumps(results, indent=1))
             if 'error' in res and not args.no_docker_control:
                 sh('docker', 'start', engine.container)  # no-op unless it was killed
@@ -880,6 +898,13 @@ def main() -> None:
         nargs='+',
         choices=[key for key, _ in VARIANTS],
         help='measure only these columns (default: all)',
+    )
+    p.add_argument(
+        '--metrics',
+        choices=['all', 'save'],
+        default='all',
+        help="'save' reloads each size, re-measures only the single node/edge saves and "
+        'merges them into the existing results (needs --resume); everything else is kept',
     )
     args = p.parse_args()
     CLUSTERS = args.clusters

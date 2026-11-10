@@ -162,7 +162,7 @@ particularly suitable for applications requiring real-time interaction and preci
 Requirements:
 
 - Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / ArcadeDB 26.10.1+ / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon OpenSearch
+- Neo4j 5.26 / FalkorDB 1.1.2 / ArcadeDB 26.11.1+ / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon OpenSearch
   Serverless collection (serves as the full text search backend) / Kuzu 0.11.2 (**deprecated**, see below)
 - OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
 
@@ -474,8 +474,8 @@ graphiti = Graphiti(graph_driver=driver)
 
 ArcadeDB is reached over its Neo4j Bolt-compatible endpoint. Start the server with the Bolt plugin enabled
 (`-Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin`; Bolt listens on port 7687, HTTP/Studio on
-2480). ArcadeDB 26.10.1 or newer is required (native fulltext/vector index DDL and the 3-argument
-`db.index.fulltext.query*` procedures).
+2480). ArcadeDB 26.11.1 or newer is required: it is the first release with the Cypher `CREATE FULLTEXT INDEX` /
+`CREATE VECTOR INDEX` DDL (26.10.x rejects it) and the 3-argument `db.index.fulltext.query*` procedures.
 
 ```python
 from graphiti_core import Graphiti
