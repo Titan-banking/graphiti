@@ -18,7 +18,7 @@ ul{padding-left:20px}li{margin:6px 0}
 </style></head><body><main>
 <h1>FalkorDB vs ArcadeDB benchmark (2026-11-09)</h1>
 <p class="muted">Graphiti's own drivers and search functions, same data on both engines, one run per cell.
-ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live test suites also pass on release 26.11.1) against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
+ArcadeDB (26.12.1-SNAPSHOT (build b8824ed068399aef60f7e06fb80241014469322d/1794261716931/main)) against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
 <div class="legend"><span><i style="background:#e5484d"></i>FalkorDB</span><span><i style="background:#8e8ea0"></i>ArcadeDB exact</span><span><i style="background:#3e63dd"></i>ArcadeDB ANN</span><span><i style="background:#30a46c"></i>ArcadeDB ANN scalar</span></div>
 
 <h2>At a glance: N=50,000 (ArcadeDB ANN vs FalkorDB)</h2>
@@ -49,7 +49,6 @@ ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live tes
 <li><strong>Integrity signals</strong> (7 <code>RecordNotFoundException</code> entries in one N=10k run and an earlier <code>GhostEdgeReporter</code> warning): node and edge counts matched N / 2N in every cell; the later audited stress runs found no mismatch (see the concurrency section below).</li>
 <li><strong>Run-to-run variance.</strong> Columns that run identical queries differ: BFS at N=50k is 699 ms in the exact column and 232 ms in the ANN columns, with no vector index involved. Treat single-run ratios below about 2x as noise.</li>
 </ul>
-
 <h2>Why ArcadeDB writes are slower</h2>
 <p>These experiments ran after the table above on the same build (<code>b8824ed</code>, source checked out at that commit); the single-save rows were then re-measured on the same build with <code>--metrics save</code> (flat parameters, write gate off): edge save c=1 p50 at N=50k went from 100.6 to 1.9 ms (ANN), 104.7 to 1.9 (scalar) and 657.8 to 3.9 (exact); c=8 from 361/362/1640 ms to 7.4/7.1/13.3 ms. Every other leg is unchanged from the original run. Treat only the N=50k edge-save change as established: node saves (unchanged code) vary 1.7-8.5 ms between columns and the early columns ran on a JVM that was not fully warm, so the smaller deltas at N=1k and 10k (including the c=8 cells that look slower) are within that noise.</p>
 <ol>
@@ -59,7 +58,6 @@ ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live tes
 <li><strong>Not the cause of the per-edge floor:</strong> the fulltext index on <code>RELATES_TO</code>, the range indexes, the bucket count (1 vs 16) and <code>MERGE</code> vs <code>CREATE</code> each changed per-edge cost by under 10%. That ablation ran on a nearly empty <code>RELATES_TO</code> type (~6k edges), so it rules them out for the floor, not for growth with N.</li>
 </ol>
 <p>The exact column&#x27;s 6x slower edge saves were the same nested-parameter scan (it also has no vector index to keep up, so the scan competed with more work); with flat parameters it is 3.9 ms against 1.9 ms for ANN at N=50k.</p>
-
 <h2>Concurrency, integrity and upstream findings</h2>
 <p>Measured with <code>benchmarks/arcadedb_concurrent_writes.py</code> (Graphiti&#x27;s <code>add_nodes_and_edges_bulk</code>, fresh database per scenario, post-run audit comparing edge records with what the vertices&#x27; OUT and IN edge lists reach). Scope: edge writes only, with the HNSW vector index off (<code>use_vector_index=False</code>); concurrent node saves with the index enabled were not measured.</p>
 <div class="scroll"><table><tr><th>scenario (8 writers)</th><th>ungated</th><th>driver <code>write_concurrency=1</code> (default)</th></tr>

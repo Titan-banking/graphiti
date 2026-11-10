@@ -330,6 +330,18 @@ ul{padding-left:20px}li{margin:6px 0}
 """
 
 
+def arcade_build(md: str) -> str:
+    """The ArcadeDB version/build the run recorded in its Setup section."""
+    m = re.search(r'^- ArcadeDB: (.+?), image', md, re.M)
+    return f'({m.group(1)})' if m else '(build not recorded)'
+
+
+def optional_section(title: str, md: str, heading: str) -> str:
+    """A hand-written section; a results file without it gets no empty heading."""
+    lines = md_section(md, heading)
+    return f'<h2>{title}</h2>\n{render_blocks(lines)}' if lines else ''
+
+
 def main() -> None:
     base = Path(sys.argv[1] if len(sys.argv) > 1 else 'benchmarks/results/2026-11-09')
     results = json.loads(base.with_suffix('.json').read_text())
@@ -349,7 +361,7 @@ def main() -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><style>{CSS}</style></head><body><main>
 <h1>{html.escape(title)}</h1>
 <p class="muted">Graphiti's own drivers and search functions, same data on both engines, one run per cell.
-ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live test suites also pass on release 26.11.1) against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
+ArcadeDB {html.escape(arcade_build(md))} against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
 <div class="legend">{legend}</div>
 
 <h2>At a glance: N={int(top):,} (ArcadeDB ANN vs FalkorDB)</h2>
@@ -359,14 +371,9 @@ ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live tes
 <h2>Charts</h2>
 <div class="charts">{chart_html}</div>
 
-<h2>Findings</h2>
-{render_blocks(md_section(md, 'Findings'))}
-
-<h2>Why ArcadeDB writes are slower</h2>
-{render_blocks(md_section(md, 'Why ArcadeDB writes are slower (follow-up investigation)'))}
-
-<h2>Concurrency, integrity and upstream findings</h2>
-{render_blocks(md_section(md, 'Concurrency, integrity and upstream findings (follow-up)'))}
+{optional_section('Findings', md, 'Findings')}
+{optional_section('Why ArcadeDB writes are slower', md, 'Why ArcadeDB writes are slower (follow-up investigation)')}
+{optional_section('Concurrency, integrity and upstream findings', md, 'Concurrency, integrity and upstream findings (follow-up)')}
 
 <h2>All numbers</h2>
 <p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the better engine only where the gap is 2x or more; smaller gaps are within this benchmark's run-to-run noise and are left unmarked.</p>

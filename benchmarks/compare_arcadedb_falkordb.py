@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import os
 import platform
 import random
 import re
@@ -76,12 +77,15 @@ GROUPS = ['g0', 'g1', 'g2']
 LIMIT = 10
 MIN_SCORE = DEFAULT_MIN_SCORE
 BATCH = 500
-FALKOR_CONTAINER = 'falkordb-bench'
-ARCADE_CONTAINER = 'arcadedb-graphiti'
-ARCADE_BOLT = 'bolt://localhost:7687'
-ARCADE_HTTP = 'http://localhost:2481'
+# Override these to run against other containers/ports (for example a second ArcadeDB while
+# another one is unreachable): BENCH_FALKOR_CONTAINER, BENCH_ARCADE_CONTAINER,
+# BENCH_ARCADE_BOLT, BENCH_ARCADE_HTTP, BENCH_FALKOR_PORT.
+FALKOR_CONTAINER = os.environ.get('BENCH_FALKOR_CONTAINER', 'falkordb-bench')
+ARCADE_CONTAINER = os.environ.get('BENCH_ARCADE_CONTAINER', 'arcadedb-graphiti')
+ARCADE_BOLT = os.environ.get('BENCH_ARCADE_BOLT', 'bolt://localhost:7687')
+ARCADE_HTTP = os.environ.get('BENCH_ARCADE_HTTP', 'http://localhost:2481')
 ARCADE_AUTH = ('root', 'playwithdata')
-FALKOR_PORT = 6380
+FALKOR_PORT = int(os.environ.get('BENCH_FALKOR_PORT', '6380'))
 
 # (column key, label)
 VARIANTS = [
