@@ -925,6 +925,10 @@ def main() -> None:
     meta['FalkorDB TIMEOUT'] = (
         'raised from the 1000 ms default to 0 so slow exact scans are measured, not aborted'
     )
+    meta['ArcadeDB driver write_concurrency'] = (
+        'None (no gate): the columns measure the engine under 8 concurrent writers; the driver '
+        'default of 1 writer per database is measured in arcadedb_concurrent_writes.py'
+    )
     results = asyncio.run(run(args))
     report = render(results, args, meta)
     Path(args.out).write_text(report)

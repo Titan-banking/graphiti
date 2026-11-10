@@ -156,6 +156,7 @@ def md_section(md: str, heading: str) -> list[str]:
 def render_blocks(lines: list[str]) -> str:
     out: list[str] = []
     open_tag = ''
+    rows: list[list[str]] = []
 
     def close() -> None:
         nonlocal open_tag
@@ -163,7 +164,26 @@ def render_blocks(lines: list[str]) -> str:
             out.append(f'</{open_tag}>')
             open_tag = ''
 
+    def flush_table() -> None:
+        nonlocal rows
+        if not rows:
+            return
+        head, *body = rows
+        cells = ''.join(f'<th>{md_inline(c)}</th>' for c in head)
+        out.append(f'<div class="scroll"><table><tr>{cells}</tr>')
+        for row in body:
+            out.append('<tr>' + ''.join(f'<td>{md_inline(c)}</td>' for c in row) + '</tr>')
+        out.append('</table></div>')
+        rows = []
+
     for line in lines:
+        if line.startswith('|'):
+            close()
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            if not all(re.fullmatch(r':?-{3,}:?', c) for c in cells):  # skip the |---| row
+                rows.append(cells)
+            continue
+        flush_table()
         ordered = re.match(r'^\d+\.\s+(.*)', line)
         if line.startswith('- ') or ordered:
             tag = 'ol' if ordered else 'ul'
@@ -174,8 +194,9 @@ def render_blocks(lines: list[str]) -> str:
             out.append(f'<li>{md_inline(ordered.group(1) if ordered else line[2:])}</li>')
         else:
             close()
-            if line.strip() and not line.startswith('|'):
+            if line.strip():
                 out.append(f'<p>{md_inline(line)}</p>')
+    flush_table()
     close()
     return '\n'.join(out)
 
@@ -328,7 +349,7 @@ def main() -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><style>{CSS}</style></head><body><main>
 <h1>{html.escape(title)}</h1>
 <p class="muted">Graphiti's own drivers and search functions, same data on both engines, one run per cell.
-ArcadeDB 26.12.1-SNAPSHOT against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
+ArcadeDB 26.12.1-SNAPSHOT (build b8824ed, the mutable snapshot tag; the live test suites also pass on release 26.11.1) against FalkorDB, 1024-dimension embeddings, 4 CPU / 5 GB per container.</p>
 <div class="legend">{legend}</div>
 
 <h2>At a glance: N={int(top):,} (ArcadeDB ANN vs FalkorDB)</h2>
@@ -343,6 +364,9 @@ ArcadeDB 26.12.1-SNAPSHOT against FalkorDB, 1024-dimension embeddings, 4 CPU / 5
 
 <h2>Why ArcadeDB writes are slower</h2>
 {render_blocks(md_section(md, 'Why ArcadeDB writes are slower (follow-up investigation)'))}
+
+<h2>Concurrency, integrity and upstream findings</h2>
+{render_blocks(md_section(md, 'Concurrency, integrity and upstream findings (follow-up)'))}
 
 <h2>All numbers</h2>
 <p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the better engine only where the gap is 2x or more; smaller gaps are within this benchmark's run-to-run noise and are left unmarked.</p>
