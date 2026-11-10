@@ -783,6 +783,19 @@ def environment(pr_sha: str) -> dict[str, Any]:
         .get('version', 'unknown')
     )
 
+    def digest_of(container: str) -> str:
+        # From the container, not the tag: a mutable tag may point at a newer image by now.
+        image_id = safe('docker', 'inspect', '-f', '{{.Image}}', container)
+        return safe('docker', 'image', 'inspect', '-f', '{{index .RepoDigests 0}}', image_id)
+
+    def env_of(container: str, name: str) -> str:
+        env = safe(
+            'docker', 'inspect', '-f', '{{range .Config.Env}}{{println .}}{{end}}', container
+        )
+        return next(
+            (e.split('=', 1)[1] for e in env.split('\n') if e.startswith(name + '=')), 'unset'
+        )
+
     def limit_of(name: str) -> str:
         mem = safe('docker', 'inspect', '-f', '{{.HostConfig.Memory}}', name)
         cpus = safe('docker', 'inspect', '-f', '{{.HostConfig.NanoCpus}}', name)
@@ -798,10 +811,9 @@ def environment(pr_sha: str) -> dict[str, Any]:
     vm = safe('docker', 'info', '--format', '{{.MemTotal}} {{.NCPU}}').split()
     vm_gib, vm_cpus = (int(vm[0]) / 2**30, vm[1]) if len(vm) == 2 else (0.0, '?')
     return {
-        'ArcadeDB': f'{arcade}, image {safe("docker", "inspect", "-f", "{{index .RepoDigests 0}}", "arcadedata/arcadedb:26.12.1-SNAPSHOT")}',
-        'FalkorDB image': safe(
-            'docker', 'inspect', '-f', '{{index .RepoDigests 0}}', 'falkordb/falkordb:latest'
-        ),
+        'ArcadeDB': f'{arcade}, image {digest_of(ARCADE_CONTAINER)}',
+        'FalkorDB image': digest_of(FALKOR_CONTAINER),
+        'ArcadeDB ARCADEDB_OPTS_MEMORY': env_of(ARCADE_CONTAINER, 'ARCADEDB_OPTS_MEMORY'),
         'container limits': limits,
         'ArcadeDB JAVA_OPTS': safe(
             'docker',

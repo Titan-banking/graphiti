@@ -89,18 +89,20 @@ def build_lucene_query(
     fulltext_syntax: str = '',
     max_query_length: int = MAX_QUERY_LENGTH,
 ) -> str:
-    """Lucene query string scoped to ``group_ids``: ``group_id:"a" OR group_id:"b" AND (q)``.
+    """Lucene query string scoped to ``group_ids``: ``(group_id:"a" OR group_id:"b") AND (q)``.
+
+    The disjunction is parenthesised: Lucene's classic parser has no AND-over-OR precedence,
+    so ``a OR b AND (q)`` makes ``a`` optional and silently drops that tenant's hits.
 
     Returns '' when the query is too long to run.
     """
+    validate_group_ids(group_ids)
     group_ids_filter_list = (
         [fulltext_syntax + f'group_id:"{g}"' for g in group_ids] if group_ids is not None else []
     )
-    group_ids_filter = ''
-    for f in group_ids_filter_list:
-        group_ids_filter += f if not group_ids_filter else f' OR {f}'
-
-    group_ids_filter += ' AND ' if group_ids_filter else ''
+    group_ids_filter = ' OR '.join(group_ids_filter_list)
+    if group_ids_filter:
+        group_ids_filter = f'({group_ids_filter}) AND '
 
     lucene_query = lucene_sanitize(query)
     # If the lucene query is too long return no query

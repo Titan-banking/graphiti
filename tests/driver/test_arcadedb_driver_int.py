@@ -21,7 +21,7 @@ ARCADEDB_HTTP_URI (see tests/helpers_test.py).
 import logging
 import os
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -474,3 +474,28 @@ async def test_graphiti_group_id_provisions_a_missing_tenant_database(driver):
     finally:
         if exists():
             _admin(f'drop database {tenant}')
+
+
+async def test_fulltext_with_several_group_ids_returns_every_listed_tenant(driver):
+    """The group clause is `group_id:"A" OR group_id:"B" AND (q)`; tenant scoping must not
+    depend on Lucene's operator precedence."""
+    rng = random.Random(11)
+    for group in ('tenant_a', 'tenant-b', 'tenant_c'):
+        for i in range(3):
+            await _entity(f'okapi {group} {i}', group, _unit(rng)).save(driver)
+
+    found = await node_fulltext_search(
+        driver, 'okapi', SearchFilters(), ['tenant_a', 'tenant-b'], limit=20
+    )
+    assert {n.group_id for n in found} == {'tenant_a', 'tenant-b'}
+    assert len(found) == 6
+
+
+async def test_non_utc_datetimes_are_stored_as_the_same_instant(driver):
+    plus_two = timezone(timedelta(hours=2))
+    created_at = datetime(2024, 3, 1, 14, 0, 0, 5, tzinfo=plus_two)
+    node = _entity('Zoned', 'G', _unit(random.Random(12)), created_at=created_at)
+    await node.save(driver)
+
+    loaded = await EntityNode.get_by_uuid(driver, node.uuid)
+    assert ensure_utc(loaded.created_at) == created_at.astimezone(timezone.utc)
