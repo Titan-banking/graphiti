@@ -374,6 +374,7 @@ ArcadeDB {html.escape(arcade_build(md))} against FalkorDB, 1024-dimension embedd
 {optional_section('Findings', md, 'Findings')}
 {optional_section('Why ArcadeDB writes are slower', md, 'Why ArcadeDB writes are slower (follow-up investigation)')}
 {optional_section('Concurrency, integrity and upstream findings', md, 'Concurrency, integrity and upstream findings (follow-up)')}
+{optional_section('Why bulk edge inserts were slower', md, "Why ArcadeDB's bulk edge inserts were slower (follow-up investigation)")}
 
 <h2>All numbers</h2>
 <p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the better engine only where the gap is 2x or more; smaller gaps are within this benchmark's run-to-run noise and are left unmarked.</p>

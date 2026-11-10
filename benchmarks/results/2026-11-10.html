@@ -45,6 +45,19 @@ ArcadeDB (26.12.1-SNAPSHOT (build ef10d046ae32370b0e9b6c39657149e969071cac/17943
 </ul>
 
 
+<h2>Why bulk edge inserts were slower</h2>
+<p>The benchmark&#x27;s bulk edge write is 313-592 edges/s on ArcadeDB against 1,421-1,443 on FalkorDB (50,000 nodes, 1024-dimension embeddings, 8 writers). Where the time goes, each step measured separately:</p>
+<div class="scroll"><table><tr><th>layer</th><th>measurement</th><th>finding</th></tr>
+<tr><td>engine, bare statement</td><td>500 random <code>CREATE (a)-[:R]-&gt;(b)</code> per transaction, HTTP, no properties</td><td>62-71k edges/s with one writer</td></tr>
+<tr><td>engine, Graphiti&#x27;s statement on its real schema</td><td><code>MERGE ... SET e = edge</code>, 8-dim embeddings, 136 indexes on <code>RELATES_TO</code></td><td>24 ms per 500 edges (20.7k edges/s); dropping every index only reaches 12.2k edges/s through the driver, so indexes are not the cost</td></tr>
+<tr><td>engine, storing a 1024-float property per edge</td><td>same vector sent once, stored on 500 edges</td><td>27.6 ms per 500 (18k edges/s)</td></tr>
+<tr><td>client, Neo4j Python driver, 500 edges x 1024 floats</td><td><code>Bolt round trip</code> 354 ms, of which pure-Python PackStream encoding 203 ms and building a debug log line <code>&quot; &quot;.join(map(repr, (query, parameters, extra)))</code> about 118 ms (evaluated even with logging off); the server samples are 98-100% blocked in a socket read</td><td><strong>most of the time is the client</strong></td></tr>
+<tr><td>client with <code>neo4j-rust-ext</code> and a constant-time-<code>repr</code> vector</td><td>same batch</td><td>21 ms per batch instead of 357 (17x)</td></tr>
+<tr><td>through <code>add_nodes_and_edges_bulk</code>, single writer (drivers 6.1.0 and 6.4.1, matching extension)</td><td>edges/s 1,163-1,176 -&gt; 3,513-3,615; nodes/s 1,339-1,423 -&gt; 7,785-7,889</td><td>the driver change is in the PR; the extension is documented</td></tr>
+<tr><td>concurrency, same engine</td><td>8 writers on shared vertices vs one writer: 21k vs 62-71k edges/s; 8 writers on disjoint vertices 106-131k</td><td>conflicting transactions: about 4 aborted attempts per commit take 83-89% of the commit-lock time. Filed as [ArcadeData/arcadedb#11498](https://github.com/ArcadeData/arcadedb/issues/11498) with a standard-library reproduction (<code>benchmarks/arcadedb_concurrent_edge_insert_repro.py</code>)</td></tr>
+<tr><td>server retry settings, 8 writers</td><td><code>txRetries=50</code>, <code>txRetryDelayBase=25</code>, <code>txRetryDelay=800</code> vs defaults</td><td>37.5k / 40.0k vs 17.8k / 17.9k edges/s, no 503s reach the client</td></tr>
+</table></div>
+<p>So the single-writer difference with FalkorDB was the Python client, and the concurrent loss is conflict handling in the engine. The Nov 10 run also measured ArcadeDB exact bulk edges at 43 edges/s (171 retries) and ANN at 313, well below the 540 and 592 of Nov 9; that was the same run that later hung the server, so I treat it as unreliable rather than as a regression.</p>
 
 <h2>All numbers</h2>
 <p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the better engine only where the gap is 2x or more; smaller gaps are within this benchmark's run-to-run noise and are left unmarked.</p>
