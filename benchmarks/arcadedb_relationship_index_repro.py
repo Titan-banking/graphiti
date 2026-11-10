@@ -11,13 +11,15 @@ Needs only Python 3.9+ (standard library) and a running ArcadeDB with its HTTP A
 
     docker run --rm -p 2480:2480 \
       -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata" \
-      arcadedata/arcadedb:latest
+      arcadedata/arcadedb:26.11.1
 
     python3 arcadedb_relationship_index_repro.py                      # localhost:2480, N=20000
     python3 arcadedb_relationship_index_repro.py --port 2480 --edges 50000
 
 Exit status 1 when a spelling expected to use the index is planned as a scan, 0 otherwise.
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
@@ -186,6 +188,7 @@ def main() -> int:
     ]
 
     bug = False
+    outcomes: list[tuple[str, bool]] = []
     header = f'{"variant":44s} {"access path":34s} {"server ms":>9s}'
     print(header + '\n' + '-' * len(header))
     for label, query, params, rows, must_seek in variants:
@@ -201,14 +204,16 @@ def main() -> int:
         seeks = 'MATCH EDGE BY INDEX' in plan
         verdict = '' if seeks else '   <-- no edge index'
         bug |= must_seek and not seeks
+        outcomes.append((label, must_seek and not seeks))
         print(f'{label:44s} {access_path(plan):34s} {statistics.median(timings):9.2f}{verdict}')
 
     if not args.keep:
         server.admin(f'drop database {db}', tolerate_errors=True)
 
+    scanned = [label[0] for label, scan in outcomes if scan]
     print(
-        '\nPRESENT: the relationship index is only used for variants A and B; every other '
-        'spelling of the same lookup scans.'
+        f'\nPRESENT: variants {", ".join(scanned)} scan instead of using the relationship index; '
+        'the others seek it.'
         if bug
         else '\nOK: every variant is answered by the relationship index.'
     )

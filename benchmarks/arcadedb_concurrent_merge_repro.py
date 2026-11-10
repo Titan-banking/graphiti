@@ -16,13 +16,15 @@ Needs only Python 3.9+ (standard library) and a running ArcadeDB with its HTTP A
 
     docker run --rm -p 2480:2480 \
       -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata" \
-      arcadedata/arcadedb:latest
+      arcadedata/arcadedb:26.11.1
 
     python3 arcadedb_concurrent_merge_repro.py                      # localhost:2480
     python3 arcadedb_concurrent_merge_repro.py --threads 2 --relationships 300
 
 Exit status 1 when scenario B stores more relationships than it should, 0 otherwise.
 """
+
+from __future__ import annotations
 
 import argparse
 import base64

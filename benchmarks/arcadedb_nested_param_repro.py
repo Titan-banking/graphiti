@@ -8,13 +8,15 @@ Needs only Python 3.9+ (standard library) and a running ArcadeDB with its HTTP A
 
     docker run --rm -p 2480:2480 \
       -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata" \
-      arcadedata/arcadedb:latest
+      arcadedata/arcadedb:26.11.1
 
     python3 arcadedb_nested_param_repro.py                       # defaults: localhost:2480, N=20000
     python3 arcadedb_nested_param_repro.py --port 2480 --nodes 50000
 
 Exit status 1 when a variant is planned as a full label scan, 0 otherwise.
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
