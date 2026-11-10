@@ -60,6 +60,7 @@ from graphiti_core.search.search import search
 from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import (
+    DEFAULT_MIN_SCORE,
     edge_fulltext_search,
     edge_similarity_search,
     node_bfs_search,
@@ -73,6 +74,7 @@ from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
 SEED = 42
 GROUPS = ['g0', 'g1', 'g2']
 LIMIT = 10
+MIN_SCORE = DEFAULT_MIN_SCORE
 BATCH = 500
 FALKOR_CONTAINER = 'falkordb-bench'
 ARCADE_CONTAINER = 'arcadedb-graphiti'
@@ -404,6 +406,20 @@ async def load(engine: Engine, n: int, concurrency: int) -> dict[str, float]:
     return {'nodes_per_s': n / node_s, 'edges_per_s': 2 * n / edge_s, 'retries': retries}
 
 
+async def count_rows(driver: GraphDriver) -> dict[str, int]:
+    """Entity and RELATES_TO counts: a load that lost rows must show in the report."""
+
+    async def one(query: str) -> int:
+        records, _, _ = await driver.execute_query(query)
+        row = records[0]
+        return int(row['c'] if isinstance(row, dict) else row[0])
+
+    return {
+        'nodes': await one('MATCH (n:Entity) RETURN count(n) AS c'),
+        'edges': await one('MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS c'),
+    }
+
+
 async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     d, dim, q, w = engine.driver, engine.dim, args.queries, args.warmup
     exact_q = args.exact_queries
@@ -413,6 +429,7 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     # 1. bulk write
     r['bulk_write'] = await load(engine, n, args.concurrency)
     r['disk_mb'] = engine.disk_mb()
+    r['counts'] = await count_rows(d)
 
     # 2. single saves, concurrency 1 and 8
     base = 10_000_000
@@ -456,7 +473,7 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     node_args = [(qvec(0, i, dim), g) for i, g in zip(pick, groups, strict=True)]
 
     async def node_sim(v, g):
-        return await node_similarity_search(d, v, filt, [g], limit=LIMIT, min_score=0.0)
+        return await node_similarity_search(d, v, filt, [g], limit=LIMIT, min_score=MIN_SCORE)
 
     n_exact = (
         exact_q if engine.key != 'arcadedb_ann' and engine.key != 'arcadedb_ann_scalar' else total
@@ -469,7 +486,9 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     edge_args = [(qvec(1, i, dim), GROUPS[i % 3]) for i in pick_edge[: exact_q + w]]
 
     async def edge_sim(v, g):
-        return await edge_similarity_search(d, v, None, None, filt, [g], limit=LIMIT, min_score=0.0)
+        return await edge_similarity_search(
+            d, v, None, None, filt, [g], limit=LIMIT, min_score=MIN_SCORE
+        )
 
     r['edge_similarity'] = summarize(await measure(edge_sim, edge_args, min(w, exact_q // 4)))
 
@@ -522,13 +541,13 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
                 ann = {
                     x.uuid
                     for x in await node_similarity_search(
-                        d, v, filt, [g], limit=LIMIT, min_score=0.0
+                        d, v, filt, [g], limit=LIMIT, min_score=MIN_SCORE
                     )
                 }
                 ex = {
                     x.uuid
                     for x in await node_similarity_search(
-                        exact_driver, v, filt, [g], limit=LIMIT, min_score=0.0
+                        exact_driver, v, filt, [g], limit=LIMIT, min_score=MIN_SCORE
                     )
                 }
                 hits += len(ann & ex)
@@ -552,7 +571,7 @@ async def bench_engine_hybrid(engine: Engine, node_args, pick, text, warmup: int
     async def python_rrf(i: int, v: list[float]):
         ft, sim = await asyncio.gather(
             node_fulltext_search(d, text(i), filt, None, limit=LIMIT),
-            node_similarity_search(d, v, filt, None, limit=LIMIT, min_score=0.0),
+            node_similarity_search(d, v, filt, None, limit=LIMIT, min_score=MIN_SCORE),
         )
         return rrf([[x.uuid for x in ft], [x.uuid for x in sim]])
 
@@ -603,11 +622,11 @@ def render(results: dict[str, Any], args, meta: dict[str, Any]) -> str:
         *[f'- {k}: {v}' for k, v in meta.items()],
         f'- dim={args.dim}, reads: {args.queries} queries after {args.warmup} warmup '
         f'({args.exact_queries} for exact full scans), write concurrency {args.concurrency}, batch {BATCH}, '
-        f'limit {LIMIT}, min_score 0 for similarity (random vectors would never pass 0.6)',
+        f'limit {LIMIT}, min_score {MIN_SCORE} (the library default) for similarity',
         '- latencies are `p50 / p95` in ms; ANN recall is recall@10 against the exact scan of the same data',
-        '- ArcadeDB runs in a JVM started with MaxRAMPercentage=75, so its container memory is dominated by '
-        'heap sizing rather than data size; FalkorDB is the data resident in Redis. Disk is the database '
-        'directory (ArcadeDB pre-sizes 16 bucket files per type) or, for FalkorDB, the RDB after SAVE.',
+        '- container memory is the peak `docker stats` reading: for ArcadeDB (a JVM) it mostly reflects heap '
+        'and page-cache sizing, not data size. Disk is the database directory (ArcadeDB pre-sizes 16 bucket '
+        'files per type) or, for FalkorDB, the growth of the RDB after SAVE.',
         '',
     ]
 
@@ -632,6 +651,16 @@ def render(results: dict[str, Any], args, meta: dict[str, Any]) -> str:
 
     rate('bulk_write', 'nodes_per_s', 'bulk write nodes/s')
     rate('bulk_write', 'edges_per_s', 'bulk write edges/s')
+    for s in sizes:
+        cells = []
+        for key, _ in VARIANTS:
+            c = results.get(key, {}).get(s, {}).get('counts')
+            if not c:
+                cells.append('n/a')
+            else:
+                ok = c['nodes'] == int(s) and c['edges'] == 2 * int(s)
+                cells.append('ok' if ok else f'MISMATCH {c["nodes"]} nodes / {c["edges"]} edges')
+        lines.append(f'| rows after load == N nodes / 2N edges | {s} | ' + ' | '.join(cells) + ' |')
     for c in (1, args.concurrency):
         for s in sizes:
             lines.append(row(f'save node c={c} (ms)', f'save_node_c{c}', s))
@@ -662,7 +691,7 @@ def render(results: dict[str, Any], args, meta: dict[str, Any]) -> str:
             cells.append(
                 'n/a'
                 if peak is None
-                else f'{peak:.0f} MiB peak / {disk if disk is not None else "?"} MB disk'
+                else f'{peak:.0f} MiB peak / {f"{disk:.0f}" if disk is not None else "?"} MB disk'
             )
         lines.append(f'| container memory / disk | {s} | ' + ' | '.join(cells) + ' |')
 
@@ -686,8 +715,19 @@ def render(results: dict[str, Any], args, meta: dict[str, Any]) -> str:
 
 
 async def run(args) -> dict[str, Any]:
+    state_file = Path(args.out).with_suffix('.json')
     results: dict[str, Any] = {}
+    if args.resume and state_file.exists():
+        results = json.loads(state_file.read_text())
+
     for key, label in VARIANTS:
+        if args.variants and key not in args.variants:
+            continue
+        done = results.setdefault(key, {})
+        todo = [n for n in args.sizes if 'error' in done.get(str(n), {'error': 1})]
+        if not todo:
+            print(f'== {label}: all sizes already measured', flush=True)
+            continue
         keep, other = (
             (FALKOR_CONTAINER, ARCADE_CONTAINER)
             if key == 'falkordb'
@@ -696,7 +736,6 @@ async def run(args) -> dict[str, Any]:
         if not args.no_docker_control:
             only_run(keep, other)
             await asyncio.sleep(8)  # let the restarted server come up
-        results[key] = {}
         if key == 'arcadedb_exact':
             # The server was just (re)started: run a throwaway load so the JVM is warm
             # and the first ArcadeDB column is not charged for it.
@@ -707,18 +746,27 @@ async def run(args) -> dict[str, Any]:
                 await load(warm, 2000, args.concurrency)
             finally:
                 await warm.close()
-        for n in args.sizes:
+        for n in todo:
             print(f'== {label} N={n}', flush=True)
             engine = Engine(key, args.dim)
             with MemorySampler(engine.container) as mem:
-                await engine.open()
                 try:
+                    await engine.open()
                     res = await bench_engine(engine, n, args)
+                except Exception as e:  # a dead server must not discard the other legs
+                    print(f'!! {label} N={n} failed: {e!r}', flush=True)
+                    res = {'error': repr(e)[:300]}
                 finally:
-                    await engine.close()
+                    try:
+                        await engine.close()
+                    except Exception as e:
+                        print(f'!! cleanup of {engine.name} failed: {e!r}', flush=True)
             res['peak_mem_mib'] = mem.peak
-            results[key][str(n)] = res
-            Path(args.out).with_suffix('.json').write_text(json.dumps(results, indent=1))
+            done[str(n)] = res
+            state_file.write_text(json.dumps(results, indent=1))
+            if 'error' in res and not args.no_docker_control:
+                sh('docker', 'start', engine.container)  # no-op unless it was killed
+                await asyncio.sleep(15)
     return results
 
 
@@ -734,12 +782,38 @@ def environment(pr_sha: str) -> dict[str, Any]:
         .json()
         .get('version', 'unknown')
     )
+
+    def limit_of(name: str) -> str:
+        mem = safe('docker', 'inspect', '-f', '{{.HostConfig.Memory}}', name)
+        cpus = safe('docker', 'inspect', '-f', '{{.HostConfig.NanoCpus}}', name)
+        try:
+            return f'{int(mem) / 2**30:.0f} GB / {int(cpus) / 1e9:.0f} CPU'
+        except ValueError:
+            return 'unknown'
+
+    limits = (
+        f'ArcadeDB {limit_of(ARCADE_CONTAINER)}, FalkorDB {limit_of(FALKOR_CONTAINER)} '
+        '(docker), one engine running at a time'
+    )
+    vm = safe('docker', 'info', '--format', '{{.MemTotal}} {{.NCPU}}').split()
+    vm_gib, vm_cpus = (int(vm[0]) / 2**30, vm[1]) if len(vm) == 2 else (0.0, '?')
     return {
         'ArcadeDB': f'{arcade}, image {safe("docker", "inspect", "-f", "{{index .RepoDigests 0}}", "arcadedata/arcadedb:26.12.1-SNAPSHOT")}',
         'FalkorDB image': safe(
             'docker', 'inspect', '-f', '{{index .RepoDigests 0}}', 'falkordb/falkordb:latest'
         ),
-        'container limits': '4 CPU / 8 GB each (docker), one engine running at a time',
+        'container limits': limits,
+        'ArcadeDB JAVA_OPTS': safe(
+            'docker',
+            'inspect',
+            '-f',
+            '{{range .Config.Env}}{{println .}}{{end}}',
+            ARCADE_CONTAINER,
+        )
+        .split('JAVA_OPTS=')[-1]
+        .split('\n')[0],
+        'shared Docker VM': f'{vm_gib:.0f} GiB RAM / {vm_cpus} CPUs, also running unrelated '
+        'containers throughout',
         'host': f'{platform.platform()}, {safe("sysctl", "-n", "machdep.cpu.brand_string")}',
         'graphiti PR #1310 head (fetched)': pr_sha,
         'this branch': safe('git', 'rev-parse', 'HEAD'),
@@ -783,6 +857,17 @@ def main() -> None:
     p.add_argument('--out', default=f'benchmarks/results/{dt.date.today().isoformat()}.md')
     p.add_argument(
         '--no-docker-control', action='store_true', help='do not stop/start the engine containers'
+    )
+    p.add_argument(
+        '--resume',
+        action='store_true',
+        help='reuse the legs already saved next to --out (<out>.json); failed legs are re-run',
+    )
+    p.add_argument(
+        '--variants',
+        nargs='+',
+        choices=[key for key, _ in VARIANTS],
+        help='measure only these columns (default: all)',
     )
     args = p.parse_args()
     CLUSTERS = args.clusters
