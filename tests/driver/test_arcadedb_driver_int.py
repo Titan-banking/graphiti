@@ -499,3 +499,35 @@ async def test_non_utc_datetimes_are_stored_as_the_same_instant(driver):
 
     loaded = await EntityNode.get_by_uuid(driver, node.uuid)
     assert ensure_utc(loaded.created_at) == created_at.astimezone(timezone.utc)
+
+
+async def test_edge_save_endpoints_are_looked_up_through_the_uuid_index(driver):
+    """The save statement must seek the Entity uuid index; a nested parameter field turns
+    each endpoint MATCH into a scan of every Entity."""
+    from graphiti_core.models.edges.edge_db_queries import (
+        get_entity_edge_save_params,
+        get_entity_edge_save_query,
+    )
+
+    rng = random.Random(13)
+    source, target = _entity('S', 'G', _unit(rng)), _entity('T', 'G', _unit(rng))
+    await source.save(driver)
+    await target.save(driver)
+    edge_data = {
+        'uuid': str(uuid4()),
+        'source_uuid': source.uuid,
+        'target_uuid': target.uuid,
+        'name': 'KNOWS',
+        'fact': 'S knows T',
+        'group_id': 'G',
+    }
+
+    result = await driver.client.execute_query(
+        'PROFILE ' + get_entity_edge_save_query(driver.provider),
+        parameters_=get_entity_edge_save_params(driver.provider, edge_data),
+        database_=driver._database,
+    )
+    plan = (result.summary.profile or {}).get('args', {}).get('string-representation', '')
+
+    assert 'NodeIndexSeek' in plan, plan
+    assert 'NodeByLabelScan' not in plan, plan

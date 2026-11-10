@@ -25,6 +25,10 @@ import re
 import sys
 from pathlib import Path
 
+# Single run per cell: identical queries differed by up to ~3x between columns (BFS at N=50k),
+# so a gap under this factor is not reported as a winner.
+NOISE_FACTOR = 2.0
+
 COLUMNS = [
     ('falkordb', 'FalkorDB', '#e5484d'),
     ('arcadedb_exact', 'ArcadeDB exact', '#8e8ea0'),
@@ -150,21 +154,29 @@ def md_section(md: str, heading: str) -> list[str]:
 
 
 def render_blocks(lines: list[str]) -> str:
-    out, in_list = [], False
+    out: list[str] = []
+    open_tag = ''
+
+    def close() -> None:
+        nonlocal open_tag
+        if open_tag:
+            out.append(f'</{open_tag}>')
+            open_tag = ''
+
     for line in lines:
-        if line.startswith('- '):
-            if not in_list:
-                out.append('<ul>')
-                in_list = True
-            out.append(f'<li>{md_inline(line[2:])}</li>')
+        ordered = re.match(r'^\d+\.\s+(.*)', line)
+        if line.startswith('- ') or ordered:
+            tag = 'ol' if ordered else 'ul'
+            if open_tag != tag:
+                close()
+                out.append(f'<{tag}>')
+                open_tag = tag
+            out.append(f'<li>{md_inline(ordered.group(1) if ordered else line[2:])}</li>')
         else:
-            if in_list:
-                out.append('</ul>')
-                in_list = False
+            close()
             if line.strip() and not line.startswith('|'):
                 out.append(f'<p>{md_inline(line)}</p>')
-    if in_list:
-        out.append('</ul>')
+    close()
     return '\n'.join(out)
 
 
@@ -190,13 +202,14 @@ def cards(results: dict, size: str) -> str:
             continue
         ratio = (a / f) if higher else (f / a)  # >1: ArcadeDB better
         factor = ratio if ratio > 1 else 1 / ratio
-        tie = factor < 1.15
-        winner = 'Tie' if tie else ('ArcadeDB' if ratio > 1 else 'FalkorDB')
+        tie = factor < NOISE_FACTOR
+        winner = 'ArcadeDB' if ratio > 1 else 'FalkorDB'
         cls = 'tie' if tie else ('arc' if ratio > 1 else 'falk')
         unit = 'rows/s' if higher else 'ms'
+        verdict = f'within noise ({factor:.1f}x)' if tie else f'{winner} {factor:.1f}x'
         out.append(
             f'<div class="card {cls}"><div class="ct">{title}</div>'
-            f'<div class="cv">{"about equal" if tie else f"{winner} {factor:.1f}x"}</div>'
+            f'<div class="cv">{verdict}</div>'
             f'<div class="cs">FalkorDB {fmt(f)} {unit} vs ArcadeDB ANN {fmt(a)} {unit}</div></div>'
         )
     return '\n'.join(out)
@@ -210,14 +223,22 @@ def table(results: dict, sizes: list[str]) -> str:
     for key, title, unit, higher in CHARTS:
         for s in sizes:
             vs = [value_and_p95(get(results.get(c, {}).get(s, {}), key)) for c, _, _ in COLUMNS]
-            nums = [v[0] for v in vs if v[0]]
-            best = (max if higher else min)(nums) if nums else None
+            fal = vs[0][0]
+            arc = [v[0] for v in vs[1:] if v[0]]
+            best_arc = (max if higher else min)(arc) if arc else None
+            win_val = None  # highlight only a clear (>= 2x) winner
+            if fal and best_arc:
+                fal_better = (fal / best_arc) if higher else (best_arc / fal)
+                if fal_better >= NOISE_FACTOR:
+                    win_val = fal
+                elif fal_better <= 1 / NOISE_FACTOR:
+                    win_val = best_arc
             cells = []
             for v, p in vs:
                 if not v:
                     cells.append('<td class="muted">n/a</td>')
                     continue
-                cls = ' class="best"' if v == best else ''
+                cls = ' class="best"' if win_val is not None and v == win_val else ''
                 txt = fmt(v) + (f' <span class="muted">/ {fmt(p)}</span>' if p else '')
                 cells.append(f'<td{cls}>{txt}</td>')
             rows.append(
@@ -320,8 +341,11 @@ ArcadeDB 26.12.1-SNAPSHOT against FalkorDB, 1024-dimension embeddings, 4 CPU / 5
 <h2>Findings</h2>
 {render_blocks(md_section(md, 'Findings'))}
 
+<h2>Why ArcadeDB writes are slower</h2>
+{render_blocks(md_section(md, 'Why ArcadeDB writes are slower (follow-up investigation)'))}
+
 <h2>All numbers</h2>
-<p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the best value in each row.</p>
+<p class="muted">Latency cells are p50 <span class="muted">/ p95</span> in ms. Green marks the better engine only where the gap is 2x or more; smaller gaps are within this benchmark's run-to-run noise and are left unmarked.</p>
 <div class="scroll">{table(results, sizes)}</div>
 
 <h2>ArcadeDB engine-fused search vs Graphiti Python RRF</h2>
