@@ -45,6 +45,8 @@ ArcadeDB (26.12.1-SNAPSHOT (build ef10d046ae32370b0e9b6c39657149e969071cac/17943
 </ul>
 
 
+<h2>After #11486</h2>
+<p>The pull request fixing #11480, #11481 and #11482 merged and a newer snapshot (build <code>601600ee3ca5</code>, digest <code>sha256:dc806df8dd02...</code>) was tested: the three reproduction scripts exit 0 (every lookup spelling seeks the relationship index; the concurrent <code>MERGE</code> stores each relationship once), the Graphiti-side workarounds for them were removed, and the minimum server for the driver is now a build with the fix. #11498 (concurrent inserts on shared vertices) reproduces unchanged on it: 8 shared writers 20.8k vs 74.4k edges/s for one, 114k on disjoint vertices, and the retry settings give 16.3k/15.8k vs 37.7k/38.8k edges/s. The write gate stays: 25-edge batches, 8 writers, 2.5-2.9k edges/s gated vs 0.2-0.5k ungated, at the cost of small concurrent saves (0.8-1.0k vs 2.0-2.6k saves/s).</p>
 <h2>Why bulk edge inserts were slower</h2>
 <p>The benchmark&#x27;s bulk edge write is 313-592 edges/s on ArcadeDB against 1,421-1,443 on FalkorDB (50,000 nodes, 1024-dimension embeddings, 8 writers). Where the time goes, each step measured separately:</p>
 <div class="scroll"><table><tr><th>layer</th><th>measurement</th><th>finding</th></tr>
