@@ -29,7 +29,8 @@ Needs only Python 3.9+ (standard library) and a running ArcadeDB with its HTTP A
 
     python3 arcadedb_unique_external_update_repro.py                 # localhost:2480
 
-Exit status 1 when any case ends with a duplicate key, 0 otherwise.
+Exit status 1 when any case ends with a duplicate key, 0 when none does, 2 when the server could not be
+reached or a statement failed (so a crash is never mistaken for the bug).
 """
 
 from __future__ import annotations
@@ -189,4 +190,8 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+        print(f'cannot run: {error}', file=sys.stderr)
+        sys.exit(2)
