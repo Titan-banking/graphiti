@@ -18,6 +18,11 @@ search functions. Needs both servers (see --help for the container names it mana
 
     docker compose -f docker-compose.arcadedb.yml up -d
     docker run -d --name falkordb-bench -p 6380:6379 --cpus 4 --memory 8g falkordb/falkordb:latest
+    # TigerGraph (amd64 only; emulated on arm64). Services take about two minutes to come up; the
+    # first run then builds the schema (about 2.5 minutes) before measuring. BENCH_TIGER_CONTAINER and
+    # BENCH_TIGER_GRAPH override the names. The vector dimension is fixed per schema (--dim).
+    docker run -d --name tigergraph-bench --platform linux/amd64 --memory 8g --cpus 4 \
+        --ulimit nofile=1000000:1000000 -p 14240:14240 -p 9000:9000 tigergraph/community:4.2.6
     uv run python benchmarks/compare_arcadedb_falkordb.py --sizes 1000 10000 50000
 
 Columns: FalkorDB (exact scan), ArcadeDB exact (use_vector_index=False, loaded without a
@@ -89,6 +94,8 @@ ARCADE_AUTH = ('root', 'playwithdata')
 FALKOR_PORT = int(os.environ.get('BENCH_FALKOR_PORT', '6380'))
 TIGER_CONTAINER = os.environ.get('BENCH_TIGER_CONTAINER', 'tigergraph-bench')
 TIGER_GRAPH = os.environ.get('BENCH_TIGER_GRAPH', 'graphiti')
+# TigerGraph ships only an amd64 image: on an arm64 host it runs emulated
+TIGER_EMULATED = platform.machine().lower() in ('arm64', 'aarch64')
 
 # (column key, label)
 VARIANTS = [
@@ -96,7 +103,7 @@ VARIANTS = [
     ('arcadedb_exact', 'ArcadeDB exact'),
     ('arcadedb_ann', 'ArcadeDB ANN'),
     ('arcadedb_ann_scalar', 'ArcadeDB ANN scalar'),
-    ('tigergraph', 'TigerGraph (x86 emulated)'),
+    ('tigergraph', 'TigerGraph (x86 emulated)' if TIGER_EMULATED else 'TigerGraph'),
 ]
 
 _VOCAB_RNG = random.Random(SEED)
@@ -329,6 +336,8 @@ class Engine:
             # One graph holds everything (``group_id`` is an attribute); its schema is built once, outside the
             # measurement, and the data is cleared before each column
             self.driver = TigerGraphDriver(graph=TIGER_GRAPH, embedding_dim=self.dim)
+            # Creates the graph, vector attributes and queries on first use (minutes); a no-op afterwards
+            await self.driver.build_indices_and_constraints()
             await self.driver.graph_ops.clear_data(self.driver)
             self.disk_base = self._du_mb()
             return
@@ -1036,8 +1045,10 @@ def main() -> None:
         'default of 1 writer per database is measured in arcadedb_concurrent_writes.py'
     )
     meta['TigerGraph'] = (
-        'tigergraph/community:4.2.6 (amd64 only) under Docker Desktop x86-64 emulation on this arm64 host; '
-        'its absolute numbers carry that overhead, ArcadeDB and FalkorDB run natively'
+        'tigergraph/community:4.2.6 (amd64 only) under Docker Desktop x86-64 emulation on this '
+        f'{platform.machine()} host; its absolute numbers carry that overhead, the other engines run natively'
+        if TIGER_EMULATED
+        else f'tigergraph/community:4.2.6 (amd64), native on this {platform.machine()} host'
     )
     meta['TigerGraph driver'] = (
         'one graph for every group, REST++ upserts (no transactions), installed GSQL queries; '
