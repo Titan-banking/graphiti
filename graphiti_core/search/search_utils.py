@@ -1312,6 +1312,11 @@ async def get_relevant_nodes(
     if len(nodes) == 0:
         return []
 
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        return await driver.search_ops.relevant_nodes(  # type: ignore[union-attr, attr-defined]
+            driver, nodes, search_filter, min_score, limit
+        )
+
     group_id = nodes[0].group_id
     query_nodes = [
         {
@@ -1465,6 +1470,11 @@ async def get_relevant_edges(
 ) -> list[list[EntityEdge]]:
     if len(edges) == 0:
         return []
+
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        return await driver.search_ops.relevant_edges(  # type: ignore[union-attr, attr-defined]
+            driver, edges, search_filter, min_score, limit
+        )
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
@@ -1650,6 +1660,11 @@ async def get_edge_invalidation_candidates(
 ) -> list[list[EntityEdge]]:
     if len(edges) == 0:
         return []
+
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        return await driver.search_ops.edge_invalidation_candidates(  # type: ignore[union-attr, attr-defined]
+            driver, edges, search_filter, min_score, limit
+        )
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider

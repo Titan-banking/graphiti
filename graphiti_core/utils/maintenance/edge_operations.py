@@ -1099,6 +1099,15 @@ async def filter_existing_duplicate_of_edges(
         (source.uuid, target.uuid): (source, target) for source, target in duplicates_node_tuples
     }
 
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        from graphiti_core.driver.tigergraph.operations.entity_edge_ops import (
+            existing_duplicate_pairs,
+        )
+
+        for pair in await existing_duplicate_pairs(driver, list(duplicate_nodes_map)):
+            duplicate_nodes_map.pop(pair)
+        return list(duplicate_nodes_map.values())
+
     if driver.provider == GraphProvider.NEPTUNE:
         query: LiteralString = """
             UNWIND $duplicate_node_uuids AS duplicate_tuple

@@ -52,6 +52,7 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.driver.tigergraph_driver import TigerGraphDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder.client import EMBEDDING_DIM, EmbedderClient
 from graphiti_core.graphiti_types import GraphitiClients
@@ -86,6 +87,8 @@ ARCADE_BOLT = os.environ.get('BENCH_ARCADE_BOLT', 'bolt://localhost:7687')
 ARCADE_HTTP = os.environ.get('BENCH_ARCADE_HTTP', 'http://localhost:2481')
 ARCADE_AUTH = ('root', 'playwithdata')
 FALKOR_PORT = int(os.environ.get('BENCH_FALKOR_PORT', '6380'))
+TIGER_CONTAINER = os.environ.get('BENCH_TIGER_CONTAINER', 'tigergraph-bench')
+TIGER_GRAPH = os.environ.get('BENCH_TIGER_GRAPH', 'graphiti')
 
 # (column key, label)
 VARIANTS = [
@@ -93,6 +96,7 @@ VARIANTS = [
     ('arcadedb_exact', 'ArcadeDB exact'),
     ('arcadedb_ann', 'ArcadeDB ANN'),
     ('arcadedb_ann_scalar', 'ArcadeDB ANN scalar'),
+    ('tigergraph', 'TigerGraph (x86 emulated)'),
 ]
 
 _VOCAB_RNG = random.Random(SEED)
@@ -235,9 +239,19 @@ def container_running(name: str) -> bool:
     return sh('docker', 'inspect', '-f', '{{.State.Running}}', name) == 'true'
 
 
-def only_run(keep: str, other: str) -> None:
-    if container_running(other):
-        sh('docker', 'stop', other)
+def engine_container(key: str) -> str:
+    if key == 'falkordb':
+        return FALKOR_CONTAINER
+    return TIGER_CONTAINER if key == 'tigergraph' else ARCADE_CONTAINER
+
+
+ALL_CONTAINERS = [FALKOR_CONTAINER, ARCADE_CONTAINER, TIGER_CONTAINER]
+
+
+def only_run(keep: str, others: list[str]) -> None:
+    for other in others:
+        if container_running(other):
+            sh('docker', 'stop', other)
     if not container_running(keep):
         sh('docker', 'start', keep)
 
@@ -294,7 +308,7 @@ class Engine:
 
     @property
     def container(self) -> str:
-        return FALKOR_CONTAINER if self.key == 'falkordb' else ARCADE_CONTAINER
+        return engine_container(self.key)
 
     async def open(self) -> None:
         if self.key == 'falkordb':
@@ -311,6 +325,13 @@ class Engine:
                 '0',
             )
             self.driver = FalkorDriver(host='localhost', port=FALKOR_PORT, database=self.name)
+        elif self.key == 'tigergraph':
+            # One graph holds everything (``group_id`` is an attribute); its schema is built once, outside the
+            # measurement, and the data is cleared before each column
+            self.driver = TigerGraphDriver(graph=TIGER_GRAPH, embedding_dim=self.dim)
+            await self.driver.graph_ops.clear_data(self.driver)
+            self.disk_base = self._du_mb()
+            return
         else:
             httpx.post(
                 f'{ARCADE_HTTP}/api/v1/server',
@@ -338,8 +359,11 @@ class Engine:
     async def close(self) -> None:
         if self.key == 'falkordb':
             await self.driver.client.select_graph(self.name).delete()  # type: ignore[attr-defined]
+        if self.key == 'tigergraph':
+            # The graph and its types are kept (creating them takes minutes); the data is not
+            await self.driver.graph_ops.clear_data(self.driver)
         await self.driver.close()
-        if self.key != 'falkordb':
+        if self.key not in ('falkordb', 'tigergraph'):
             httpx.post(
                 f'{ARCADE_HTTP}/api/v1/server',
                 json={'command': f'drop database {self.name}'},
@@ -352,6 +376,8 @@ class Engine:
             if self.key == 'falkordb':
                 sh('docker', 'exec', FALKOR_CONTAINER, 'redis-cli', 'SAVE')
                 path = '/var/lib/falkordb/data'
+            elif self.key == 'tigergraph':
+                path = '/home/tigergraph/tigergraph/data/gstore'
             else:
                 path = f'/home/arcadedb/databases/{self.name}'
             out = sh('docker', 'exec', self.container, 'sh', '-c', f'du -sk {path} | cut -f1')
@@ -360,10 +386,13 @@ class Engine:
             return None
 
     def disk_mb(self) -> float | None:
-        """On-disk size after the load. ArcadeDB: the database's own directory. FalkorDB
-        shares one data dir between graphs, so it is the growth since this graph was created."""
+        """On-disk size after the load. ArcadeDB: the database's own directory. FalkorDB and TigerGraph
+        share one data dir between graphs, so it is the growth since the column was opened."""
         now = self._du_mb()
         if now is None:
+            return None
+        if self.key == 'tigergraph':
+            # gstore keeps preallocated segments, so its growth after a clear is churn, not the size of the data
             return None
         if self.key == 'falkordb':
             return None if self.disk_base is None else now - self.disk_base
@@ -414,8 +443,65 @@ async def load(engine: Engine, n: int, concurrency: int) -> dict[str, float]:
     return {'nodes_per_s': n / node_s, 'edges_per_s': 2 * n / edge_s, 'retries': retries}
 
 
+async def exact_recall(
+    driver: GraphDriver, queries: list[tuple[list[float], str]], n: int, dim: int, extra: list[int]
+) -> float | None:
+    """Recall@10 of the engine's node similarity against an exact cosine ranking computed here (numpy).
+
+    The ranking covers every entity stored: ``0..n-1`` and the ``extra`` ids the single-save leg wrote. The vectors
+    are regenerated from their seeds, so nothing from the load is kept in memory.
+    """
+    by_group: dict[str, tuple[list[int], np.ndarray]] = {}
+    for g, group in enumerate(GROUPS):
+        ids = [*range(g, n, len(GROUPS)), *[i for i in extra if i % len(GROUPS) == g]]
+        by_group[group] = (ids, np.asarray([vec(0, i, dim) for i in ids], dtype=np.float32))
+    hits = total = 0
+    for v, group in queries:
+        ids, matrix = by_group[group]
+        q = np.asarray(v, dtype=np.float32)
+        scores = (1.0 + matrix @ q / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q))) / 2.0
+        order = np.argsort(-scores)[:LIMIT]
+        exact = {node_uuid(ids[i]) for i in order if scores[i] >= MIN_SCORE}
+        found = {
+            x.uuid
+            for x in await node_similarity_search(
+                driver, v, SearchFilters(), [group], limit=LIMIT, min_score=MIN_SCORE
+            )
+        }
+        hits += len(found & exact)
+        total += len(exact)
+    return hits / total if total else None
+
+
+async def wait_for_vector_index(driver: TigerGraphDriver, n: int, dim: int) -> float:
+    """Seconds until a vector search finds the last entity written (TigerGraph's vector index trails its writes)."""
+    last = n - 1
+    start = time.perf_counter()
+    while time.perf_counter() - start < 600:
+        found = await node_similarity_search(
+            driver,
+            vec(0, last, dim),
+            SearchFilters(),
+            [GROUPS[last % len(GROUPS)]],
+            limit=5,
+            min_score=0.99,
+        )
+        if any(x.uuid == node_uuid(last) for x in found):
+            return time.perf_counter() - start
+        await asyncio.sleep(0.5)
+    return float('inf')
+
+
 async def count_rows(driver: GraphDriver) -> dict[str, int]:
     """Entity and RELATES_TO counts: a load that lost rows must show in the report."""
+    if isinstance(driver, TigerGraphDriver):
+        results = await driver.client.interpret(
+            '',
+            'SumAccum<INT> @@n; S = {Entity.*}; R = SELECT t FROM S:s -(RELATES_TO:e)-> Entity:t'
+            ' ACCUM @@n += 1; PRINT S.size(), @@n;',
+        )
+        flat = {k: v for block in results for k, v in block.items()}
+        return {'nodes': int(flat['S.size()']), 'edges': int(flat['@@n'])}
 
     async def one(query: str) -> int:
         records, _, _ = await driver.execute_query(query)
@@ -438,6 +524,8 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     r['bulk_write'] = await load(engine, n, args.concurrency)
     r['disk_mb'] = engine.disk_mb()
     r['counts'] = await count_rows(d)
+    if isinstance(d, TigerGraphDriver):
+        r['vector_index_catch_up_s'] = await wait_for_vector_index(d, n, dim)
 
     # 2. single saves, concurrency 1 and 8
     base = 10_000_000
@@ -487,11 +575,16 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
         return await node_similarity_search(d, v, filt, [g], limit=LIMIT, min_score=MIN_SCORE)
 
     n_exact = (
-        exact_q if engine.key != 'arcadedb_ann' and engine.key != 'arcadedb_ann_scalar' else total
+        exact_q
+        if engine.key not in ('arcadedb_ann', 'arcadedb_ann_scalar', 'tigergraph')
+        else total
     )
     r['node_similarity'] = summarize(
         await measure(node_sim, node_args[:n_exact], min(w, n_exact // 4))
     )
+    if engine.key == 'tigergraph':
+        extra = [base + c * 1000 + i for c in (1, args.concurrency) for i in range(q)]
+        r['ann_recall_at_10'] = await exact_recall(d, node_args[w : w + 50], n, dim, extra)
 
     # 5. edge similarity: exact everywhere
     edge_args = [(qvec(1, i, dim), GROUPS[i % 3]) for i in pick_edge[: exact_q + w]]
@@ -696,6 +789,14 @@ def render(results: dict[str, Any], args, meta: dict[str, Any]) -> str:
     for s in sizes:
         cells = []
         for key, _ in VARIANTS:
+            v = results.get(key, {}).get(s, {}).get('vector_index_catch_up_s')
+            cells.append('n/a' if v is None else f'{v:.1f} s')
+        lines.append(
+            f'| vector index catch-up after the bulk load | {s} | ' + ' | '.join(cells) + ' |'
+        )
+    for s in sizes:
+        cells = []
+        for key, _ in VARIANTS:
             m = results.get(key, {}).get(s, {})
             disk = m.get('disk_mb')
             peak = m.get('peak_mem_mib')
@@ -743,13 +844,9 @@ async def run(args) -> dict[str, Any]:
         if not todo:
             print(f'== {label}: all sizes already measured', flush=True)
             continue
-        keep, other = (
-            (FALKOR_CONTAINER, ARCADE_CONTAINER)
-            if key == 'falkordb'
-            else (ARCADE_CONTAINER, FALKOR_CONTAINER)
-        )
+        keep = engine_container(key)
         if not args.no_docker_control:
-            only_run(keep, other)
+            only_run(keep, [c for c in ALL_CONTAINERS if c != keep])
             await asyncio.sleep(8)  # let the restarted server come up
         if key == 'arcadedb_exact':
             # The server was just (re)started: run a throwaway load so the JVM is warm
@@ -827,8 +924,8 @@ def environment(pr_sha: str) -> dict[str, Any]:
             return 'unknown'
 
     limits = (
-        f'ArcadeDB {limit_of(ARCADE_CONTAINER)}, FalkorDB {limit_of(FALKOR_CONTAINER)} '
-        '(docker), one engine running at a time'
+        f'ArcadeDB {limit_of(ARCADE_CONTAINER)}, FalkorDB {limit_of(FALKOR_CONTAINER)}, '
+        f'TigerGraph {limit_of(TIGER_CONTAINER)} (docker), one engine running at a time'
     )
     vm = safe('docker', 'info', '--format', '{{.MemTotal}} {{.NCPU}}').split()
     vm_gib, vm_cpus = (int(vm[0]) / 2**30, vm[1]) if len(vm) == 2 else (0.0, '?')
@@ -914,8 +1011,13 @@ def main() -> None:
     CLUSTERS = args.clusters
 
     if not args.no_docker_control:
-        # environment() asks the ArcadeDB server for its version; run() stops one at a time.
-        for container in (ARCADE_CONTAINER, FALKOR_CONTAINER):
+        # environment() asks the ArcadeDB server for its version; run() stops all but one engine at a time.
+        wanted = {ARCADE_CONTAINER} | {
+            engine_container(key)
+            for key, _ in VARIANTS
+            if not args.variants or key in args.variants
+        }
+        for container in wanted:
             if not container_running(container):
                 sh('docker', 'start', container)
         time.sleep(10)
@@ -932,6 +1034,14 @@ def main() -> None:
     meta['ArcadeDB driver write_concurrency'] = (
         'None (no gate): the columns measure the engine under 8 concurrent writers; the driver '
         'default of 1 writer per database is measured in arcadedb_concurrent_writes.py'
+    )
+    meta['TigerGraph'] = (
+        'tigergraph/community:4.2.6 (amd64 only) under Docker Desktop x86-64 emulation on this arm64 host; '
+        'its absolute numbers carry that overhead, ArcadeDB and FalkorDB run natively'
+    )
+    meta['TigerGraph driver'] = (
+        'one graph for every group, REST++ upserts (no transactions), installed GSQL queries; '
+        'fulltext is a token scan, edge similarity an exact scan, node similarity HNSW (eventually consistent)'
     )
     results = asyncio.run(run(args))
     report = render(results, args, meta)
