@@ -191,12 +191,14 @@ class ArcadeDBDriver(GraphDriver):
                 Defaults to the Bolt host on port 2480. If it is unreachable a warning
                 is logged and types are created implicitly with the default bucket
                 count; nothing else depends on it.
-            embedding_dim: Dimension of the node embeddings for the HNSW vector index.
+            embedding_dim: Dimension of the embeddings for the HNSW vector indexes.
                 ``None`` lets the index size itself from the first vector written.
             vector_quantization: ``'none'``, ``'scalar'`` or ``'binary'`` quantization of
                 the vector index (memory vs. recall).
-            use_vector_index: ``False`` skips creating the vector indexes and makes node
-                and community similarity search score exactly, in the query.
+            use_vector_index: ``False`` skips creating the vector indexes (nodes,
+                communities and the ``RELATES_TO`` facts) and makes similarity search score
+                exactly, in the query. With the indexes, an edge similarity search is
+                answered by the index of the facts instead of scoring every fact.
             buckets: Bucket count for the types pre-created over HTTP.
             write_concurrency: Writers admitted at once per database from this process
                 (``None`` for no limit). ArcadeDB resolves concurrent transactions that
@@ -565,11 +567,60 @@ class ArcadeDBDriver(GraphDriver):
                     )
                     return
 
+    async def _create_embedding_properties(self) -> None:
+        """Declare the embedding properties as float arrays over HTTP/SQL.
+
+        The edges and the nodes are written with a single ``SET e = $edge_data`` / ``SET n =
+        $entity_data``, so a property that is not declared gets the type of the value it is
+        written with: a plain ``LIST`` of boxed doubles. Reading such a list back is what
+        dominates an exact edge-similarity scan (the scan reads every fact's embedding, and
+        every component of it costs a type byte, a boxed ``Double`` and a list slot), while a
+        property declared ``ARRAY_OF_FLOATS`` is read back as one compact ``float[]`` - the
+        same shape every other backend stores.
+
+        Declaring the property is enough: ArcadeDB converts the list to the declared array on
+        write, so the write path is unchanged. Best-effort: if the HTTP API is unreachable the
+        property is created implicitly on the first write, as before, and only the read is
+        slower.
+        """
+        statements = [
+            f'CREATE PROPERTY {type_name}.name_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
+            for type_name in ARCADEDB_VERTEX_TYPES
+            if type_name in ('Entity', 'Community')
+        ] + [
+            f'CREATE PROPERTY {type_name}.fact_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
+            for type_name in ARCADEDB_EDGE_TYPES
+            if type_name == 'RELATES_TO'
+        ]
+
+        async with httpx.AsyncClient() as client:
+            failures: list[str] = []
+            for statement in statements:
+                try:
+                    response = await client.post(
+                        f'{self._http_uri}/api/v1/command/{self._database}',
+                        json={'language': 'sql', 'command': statement},
+                        auth=(self._user, self._password),
+                        timeout=30.0,
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPError as e:
+                    failures.append(f'{statement} ({e})')
+
+            if failures:
+                logger.warning(
+                    f'Could not declare the ArcadeDB embedding properties via the HTTP API at '
+                    f'{self._http_uri}: {"; ".join(failures)}; the embeddings are stored as '
+                    f'lists of doubles instead of float arrays, which makes an exact '
+                    f'edge-similarity scan slower to read.'
+                )
+
     async def build_indices_and_constraints(self, delete_existing: bool = False):
         if delete_existing:
             await self.delete_all_indexes()
 
         await self._create_types()
+        await self._create_embedding_properties()
         await self._warn_if_server_predates_fixes()
 
         queries: list[LiteralString] = get_range_indices(self.provider) + get_fulltext_indices(

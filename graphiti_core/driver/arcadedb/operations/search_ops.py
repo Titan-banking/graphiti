@@ -16,7 +16,12 @@ limitations under the License.
 
 from typing import Any
 
-from graphiti_core.driver.arcadedb.search_queries import ann_search
+from graphiti_core.driver.arcadedb.search_queries import (
+    EDGE_VECTOR_LABEL,
+    EDGE_VECTOR_PROP,
+    ann_search,
+    edge_ann_applicable,
+)
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.driver.query_executor import QueryExecutor
@@ -52,12 +57,13 @@ class ArcadeDBSearchOperations(SearchOperations):
     """Search operations for ArcadeDB.
 
     Fulltext search goes through ``db.index.fulltext.query*`` with the same Lucene query
-    string as the other providers (``group_id:"x" AND (...)``). Node and community
-    similarity use the HNSW vector index (``db.index.vector.queryNodes``) when the
-    executor is an ``ArcadeDBDriver`` with ``use_vector_index`` set, and otherwise score
-    exactly in the query; edge similarity is always exact because ArcadeDB has no
-    relationship ANN procedure. These build the same queries as
-    ``graphiti_core.search.search_utils``, which is the path ``Graphiti.search`` takes.
+    string as the other providers (``group_id:"x" AND (...)``). Node, community and edge
+    similarity use the HNSW vector index (``db.index.vector.queryNodes``, which answers an
+    index over a relationship type as well) when the executor is an ``ArcadeDBDriver`` with
+    ``use_vector_index`` set, and otherwise score exactly in the query. An edge search that
+    pins an endpoint, or filters on the endpoints, is always exact. These build the same
+    queries as ``graphiti_core.search.search_utils``, which is the path ``Graphiti.search``
+    takes.
     """
 
     # --- Node search ---
@@ -306,17 +312,36 @@ class ArcadeDBSearchOperations(SearchOperations):
             search_filter, GraphProvider.ARCADEDB
         )
 
+        if getattr(executor, 'use_vector_index', False) and edge_ann_applicable(
+            filter_queries, source_node_uuid, target_node_uuid
+        ):
+            ann_records = await ann_search(
+                executor,
+                label=EDGE_VECTOR_LABEL,
+                prop=EDGE_VECTOR_PROP,
+                alias='e',
+                return_query=get_entity_edge_return_query(GraphProvider.ARCADEDB),
+                search_vector=search_vector,
+                filter_queries=filter_queries,
+                filter_params=filter_params,
+                group_ids=group_ids,
+                limit=limit,
+                min_score=min_score,
+            )
+            if ann_records is not None:
+                return [entity_edge_from_record(r) for r in ann_records]
+
         if group_ids is not None:
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-            if source_node_uuid is not None:
-                filter_params['source_uuid'] = source_node_uuid
-                filter_queries.append('n.uuid = $source_uuid')
+        if source_node_uuid is not None:
+            filter_params['source_uuid'] = source_node_uuid
+            filter_queries.append('n.uuid = $source_uuid')
 
-            if target_node_uuid is not None:
-                filter_params['target_uuid'] = target_node_uuid
-                filter_queries.append('m.uuid = $target_uuid')
+        if target_node_uuid is not None:
+            filter_params['target_uuid'] = target_node_uuid
+            filter_queries.append('m.uuid = $target_uuid')
 
         filter_queries.append('e.fact_embedding IS NOT NULL')
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))

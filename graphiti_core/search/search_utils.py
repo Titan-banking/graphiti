@@ -23,7 +23,12 @@ import numpy as np
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
-from graphiti_core.driver.arcadedb.search_queries import ann_search
+from graphiti_core.driver.arcadedb.search_queries import (
+    EDGE_VECTOR_LABEL,
+    EDGE_VECTOR_PROP,
+    ann_search,
+    edge_ann_applicable,
+)
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -344,6 +349,27 @@ async def edge_similarity_search(
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
     )
+
+    if (
+        driver.provider == GraphProvider.ARCADEDB
+        and getattr(driver, 'use_vector_index', False)
+        and edge_ann_applicable(filter_queries, source_node_uuid, target_node_uuid)
+    ):
+        ann_records = await ann_search(
+            driver,
+            label=EDGE_VECTOR_LABEL,
+            prop=EDGE_VECTOR_PROP,
+            alias='e',
+            return_query=get_entity_edge_return_query(driver.provider),
+            search_vector=search_vector,
+            filter_queries=filter_queries,
+            filter_params=filter_params,
+            group_ids=group_ids,
+            limit=limit,
+            min_score=min_score,
+        )
+        if ann_records is not None:
+            return [get_entity_edge_from_record(record, driver.provider) for record in ann_records]
 
     if group_ids is not None:
         filter_queries.append('e.group_id IN $group_ids')

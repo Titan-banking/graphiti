@@ -170,12 +170,17 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
 
 ArcadeDBVectorQuantization = Literal['none', 'scalar', 'binary']
 
-# (index name, node label) pairs that get an ANN index. Relationships have no ANN
-# procedure in ArcadeDB (db.index.vector only has queryNodes), so fact_embedding is
-# searched exactly and gets no index.
+# (index name, node label) pairs that get an ANN index on ``name_embedding``.
 ARCADEDB_VECTOR_INDEXES: tuple[tuple[str, str], ...] = (
     ('entity_name_embedding', 'Entity'),
     ('community_name_embedding', 'Community'),
+)
+
+# (index name, relationship type) pairs that get an ANN index on ``fact_embedding``.
+# ``db.index.vector.queryNodes`` answers an index over a relationship type as well, which
+# is what edge similarity search uses instead of scoring every fact.
+ARCADEDB_EDGE_VECTOR_INDEXES: tuple[tuple[str, str], ...] = (
+    ('relates_to_fact_embedding', 'RELATES_TO'),
 )
 
 
@@ -206,6 +211,11 @@ def get_vector_indices(
             f'CREATE VECTOR INDEX {index_name} IF NOT EXISTS FOR (n:{label}) '
             f'ON n.name_embedding OPTIONS {{indexConfig: {{{options}}}}}'
             for index_name, label in ARCADEDB_VECTOR_INDEXES
+        ]
+        + [
+            f'CREATE VECTOR INDEX {index_name} IF NOT EXISTS FOR ()-[e:{rel_type}]-() '
+            f'ON e.fact_embedding OPTIONS {{indexConfig: {{{options}}}}}'
+            for index_name, rel_type in ARCADEDB_EDGE_VECTOR_INDEXES
         ],
     )
 

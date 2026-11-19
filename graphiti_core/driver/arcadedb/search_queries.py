@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import re
 from typing import Any, cast
 
 from typing_extensions import LiteralString
@@ -42,6 +43,7 @@ def ann_query(
     filter_queries: list[str],
     by_group: bool,
     limit: int,
+    prop: str = 'name_embedding',
 ) -> tuple[LiteralString, int]:
     """Build the ANN similarity query and the ``k`` to request from the index.
 
@@ -53,13 +55,17 @@ def ann_query(
     ``score`` from ``queryNodes`` is already ``(1 + cosine) / 2``, the scale of
     ``get_vector_cosine_func_query`` and of ``min_score``.
 
+    ``prop`` is the indexed property: ``name_embedding`` of a node label (the default) or
+    ``fact_embedding`` of a relationship type. The index call yields the record either way,
+    so ``alias`` is a node or a relationship of whatever ``return_query`` reads.
+
     Params the query expects: ``search_vector``, ``k``, ``limit``, ``min_score``, plus
     ``group_ids`` when ``by_group`` and whatever ``filter_queries`` reference.
     """
     k = limit * ARCADEDB_ANN_OVERFETCH if filter_queries else limit
     where = ' AND '.join(['score > $min_score', *filter_queries])
     query = (
-        f'{_ann_call(label, by_group)} '
+        f'{_ann_call(label, by_group, prop)} '
         f'YIELD node AS {alias}, score '
         f'WITH {alias}, score WHERE {where} '
         f'RETURN {return_query} '
@@ -68,7 +74,7 @@ def ann_query(
     return cast(LiteralString, query), k
 
 
-def _vector_index_unavailable(error: Exception, label: str) -> bool:
+def _vector_index_unavailable(error: Exception, label: str, prop: str = 'name_embedding') -> bool:
     """Whether ``error`` says the vector index (or its type) does not exist yet.
 
     ArcadeDB 26.11.1 words it "No vector index found on property 'name_embedding' for type
@@ -77,29 +83,53 @@ def _vector_index_unavailable(error: Exception, label: str) -> bool:
     """
     message = str(error)
     return (
-        f"No vector index found on property 'name_embedding' for type '{label}'" in message
+        f"No vector index found on property '{prop}' for type '{label}'" in message
         or f"Type with name '{label}' was not found" in message
     )
 
 
-def _ann_call(label: str, by_group: bool) -> str:
+def _ann_call(label: str, by_group: bool, prop: str = 'name_embedding') -> str:
     options = ", {where: 'group_id IN :group_ids'}" if by_group else ''
     return (
-        f"CALL db.index.vector.queryNodes('{vector_index_name(label)}', $k, "
+        f"CALL db.index.vector.queryNodes('{vector_index_name(label, prop)}', $k, "
         f'$search_vector{options})'
     )
 
 
-def ann_window_query(*, label: str, by_group: bool) -> LiteralString:
+def ann_window_query(*, label: str, by_group: bool, prop: str = 'name_embedding') -> LiteralString:
     """How many candidates the index returns for ``k`` and how weak the last one is.
 
     Params: ``search_vector``, ``k`` and ``group_ids`` when ``by_group``.
     """
     query = (
-        f'{_ann_call(label, by_group)} YIELD score '
+        f'{_ann_call(label, by_group, prop)} YIELD score '
         'RETURN count(score) AS candidates, min(score) AS lowest'
     )
     return cast(LiteralString, query)
+
+
+# A reference to the endpoints of a relationship in a filter: ``n.uuid``, ``m.labels``, ``n:Label``.
+_ENDPOINT_REFERENCE = re.compile(r'(?<![\w.])[nm][.:]')
+
+EDGE_VECTOR_LABEL = 'RELATES_TO'
+EDGE_VECTOR_PROP = 'fact_embedding'
+
+
+def edge_ann_applicable(
+    filter_queries: list[str],
+    source_node_uuid: str | None,
+    target_node_uuid: str | None,
+) -> bool:
+    """Whether an edge similarity search can be answered by the relationship vector index.
+
+    The index call yields the relationship alone. A search that pins an endpoint
+    (``source_node_uuid`` / ``target_node_uuid``, the duplicate-detection form) or whose
+    filters read the endpoints (``n.uuid``, node labels) needs the ``MATCH`` the exact scan
+    runs, so it stays exact.
+    """
+    if source_node_uuid is not None or target_node_uuid is not None:
+        return False
+    return not any(_ENDPOINT_REFERENCE.search(query) for query in filter_queries)
 
 
 async def ann_search(
@@ -114,6 +144,7 @@ async def ann_search(
     group_ids: list[str] | None,
     limit: int,
     min_score: float,
+    prop: str = 'name_embedding',
 ) -> list[Any] | None:
     """Run the ANN query; ``None`` means "use the exact in-query scan instead".
 
@@ -129,6 +160,7 @@ async def ann_search(
         filter_queries=filter_queries,
         by_group=group_ids is not None,
         limit=limit,
+        prop=prop,
     )
     params: dict[str, Any] = dict(filter_params)
     if group_ids is not None:
@@ -145,9 +177,9 @@ async def ann_search(
             **params,
         )
     except Exception as e:
-        if _vector_index_unavailable(e, label):
+        if _vector_index_unavailable(e, label, prop):
             logger.warning(
-                f'ArcadeDB vector index {vector_index_name(label)} unavailable, falling back '
+                f'ArcadeDB vector index {vector_index_name(label, prop)} unavailable, falling back '
                 f'to exact similarity search: {e}'
             )
             return None
@@ -159,7 +191,7 @@ async def ann_search(
         # everything beyond it scores lower. Otherwise the index was exhausted (a small tenant)
         # or min_score ended the list, and the answer is already complete.
         window, _, _ = await executor.execute_query(
-            ann_window_query(label=label, by_group=group_ids is not None),
+            ann_window_query(label=label, by_group=group_ids is not None, prop=prop),
             search_vector=search_vector,
             k=k,
             routing_='r',
