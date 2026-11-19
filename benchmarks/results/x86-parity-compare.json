@@ -1,0 +1,62 @@
+{
+  "node_bfs_depth2_limit100000": {
+    "jaccard_mean": 1.0,
+    "jaccard_min": 1.0,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "node_bfs_depth2_limit10": {
+    "jaccard_mean": 0.0972609219126247,
+    "jaccard_min": 0.0,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "edge_bfs_depth2_limit100000": {
+    "jaccard_mean": 1.0,
+    "jaccard_min": 1.0,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "edge_bfs_depth2_limit10": {
+    "jaccard_mean": 0.09911850705194358,
+    "jaccard_min": 0.0,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "node_similarity": {
+    "jaccard_mean": 1.0,
+    "jaccard_min": 1.0,
+    "same_order_all": true,
+    "calls": 20
+  },
+  "edge_similarity": {
+    "jaccard_mean": 1.0,
+    "jaccard_min": 1.0,
+    "same_order_all": true,
+    "calls": 20
+  },
+  "node_fulltext": {
+    "jaccard_mean": 0.22197712418300655,
+    "jaccard_min": 0.1111111111111111,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "edge_fulltext": {
+    "jaccard_mean": 0.13957688338493293,
+    "jaccard_min": 0.05263157894736842,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "hybrid_rrf_nodes": {
+    "jaccard_mean": 0.3857142857142857,
+    "jaccard_min": 0.3333333333333333,
+    "same_order_all": false,
+    "calls": 20
+  },
+  "hybrid_rrf_edges": {
+    "jaccard_mean": 0.1603045604206595,
+    "jaccard_min": 0.05263157894736842,
+    "same_order_all": false,
+    "calls": 20
+  }
+}
