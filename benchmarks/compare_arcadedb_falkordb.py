@@ -79,7 +79,9 @@ from graphiti_core.tracer import NoOpTracer
 from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk
 
 SEED = 42
-GROUPS = ['g0', 'g1', 'g2']
+# BENCH_GROUPS sets the tenant count (default 3: each group is a third of the data, so a group
+# filter is barely selective; real multi-tenant data is far more selective).
+GROUPS = [f'g{i}' for i in range(int(os.environ.get('BENCH_GROUPS', '3')))]
 LIMIT = 10
 MIN_SCORE = DEFAULT_MIN_SCORE
 BATCH = 500
@@ -572,7 +574,7 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
     r['edge_fulltext'] = summarize(
         await measure(
             lambda t, g: edge_fulltext_search(d, t, filt, [g], limit=LIMIT),
-            [(edge_text(i), GROUPS[i % 3]) for i in pick_edge],
+            [(edge_text(i), GROUPS[i % len(GROUPS)]) for i in pick_edge],
             w,
         )
     )
@@ -596,7 +598,7 @@ async def bench_engine(engine: Engine, n: int, args) -> dict[str, Any]:
         r['ann_recall_at_10'] = await exact_recall(d, node_args[w : w + 50], n, dim, extra)
 
     # 5. edge similarity: exact everywhere
-    edge_args = [(qvec(1, i, dim), GROUPS[i % 3]) for i in pick_edge[: exact_q + w]]
+    edge_args = [(qvec(1, i, dim), GROUPS[i % len(GROUPS)]) for i in pick_edge[: exact_q + w]]
 
     async def edge_sim(v, g):
         return await edge_similarity_search(
