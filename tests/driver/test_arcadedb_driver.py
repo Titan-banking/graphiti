@@ -1,0 +1,1130 @@
+"""
+Copyright 2024, Zep Software, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import asyncio
+import os
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from graphiti_core.driver.driver import GraphProvider
+
+try:
+    from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
+
+    HAS_ARCADEDB = True
+except ImportError:
+    ArcadeDBDriver = None
+    HAS_ARCADEDB = False
+
+
+class TestArcadeDBDriver:
+    """Comprehensive test suite for ArcadeDB driver."""
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def setup_method(self):
+        """Set up test fixtures."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            self.driver = ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='test',
+                database='graphiti',
+            )
+        self.mock_client = MagicMock()
+        self.driver.client = self.mock_client
+        # The unit tests must not reach a live server. The driver derives its HTTP API URI from the
+        # Bolt URI, so on a machine where an ArcadeDB listens on the default HTTP port - a dev box,
+        # a CI runner with a service container - these tests would send it CREATE PROPERTY, and the
+        # DDL would land in a database that is not theirs. An unreachable address keeps every test
+        # that does not patch the HTTP client itself off the network.
+        self.driver._http_uri = 'http://127.0.0.1:1'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_provider(self):
+        """Test driver provider identification."""
+        assert self.driver.provider == GraphProvider.ARCADEDB
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_init_with_connection_params(self):
+        """Test initialization with connection parameters."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            driver = ArcadeDBDriver(
+                uri='bolt://custom-host:7687',
+                user='admin',
+                password='secret',
+                database='mydb',
+            )
+            assert driver.provider == GraphProvider.ARCADEDB
+            mock_agd.driver.assert_called_once_with(
+                uri='bolt://custom-host:7687',
+                auth=('admin', 'secret'),
+            )
+            assert driver._database == 'mydb'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_init_with_none_credentials(self):
+        """Test initialization with None user/password defaults to empty strings."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user=None,
+                password=None,
+            )
+            mock_agd.driver.assert_called_once_with(
+                uri='bolt://localhost:7687',
+                auth=('', ''),
+            )
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_default_database(self):
+        """Test default database name is 'graphiti'."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            driver = ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='test',
+            )
+            assert driver._database == 'graphiti'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_clone_switches_database(self):
+        """clone() must return a driver bound to the requested database.
+
+        Regression test: GraphDriver.clone() returns self. On ArcadeDB a
+        database is the tenant boundary, so inheriting that default made a
+        per-tenant switch silently keep querying the previous tenant's
+        database -- no error, just zero rows.
+        """
+        cloned = self.driver.clone('other_tenant')
+
+        assert cloned is not self.driver
+        assert cloned._database == 'other_tenant'
+        assert self.driver._database == 'graphiti'
+        assert isinstance(cloned, ArcadeDBDriver)
+        # the Bolt client is per-connection, not per-database, and is shared
+        assert cloned.client is self.driver.client
+        assert cloned._http_uri == self.driver._http_uri
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_clone_maps_the_default_group_id_to_the_constructed_database(self):
+        """Graphiti's default group_id is '' (add_episode without group_id), which names no
+        database; Graphiti then reads with group_ids=[''], and that must reach the
+        database the driver was constructed with, even from another tenant's clone."""
+        assert self.driver.clone('')._database == 'graphiti'
+        assert self.driver.clone('tenant_a').clone('')._database == 'graphiti'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_clone_session_targets_cloned_database(self):
+        """A cloned driver's session() must open on the cloned database."""
+        cloned = self.driver.clone('other_tenant')
+        cloned.client = MagicMock()
+
+        cloned.session()
+
+        cloned.client.session.assert_called_once_with(database='other_tenant')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_execute_query_success(self):
+        """Test successful query execution.
+
+        Regression test: `database_` must be passed as a real kwarg to the
+        underlying `neo4j` driver call (`execute_query(..., database_=...)`),
+        NOT stuffed inside `parameters_` (a Cypher query parameter, which the
+        neo4j driver's own `execute_query()` never reads to route the request).
+        The previous version of this test asserted the buggy behaviour
+        (`parameters_={'database_': 'graphiti'}`), which caused a real
+        cross-tenant data leak: `execute_query()` always hit the driver's
+        default database regardless of `with_database(...)`.
+        """
+        mock_result = MagicMock()
+        self.mock_client.execute_query = AsyncMock(return_value=mock_result)
+
+        result = await self.driver.execute_query('MATCH (n) RETURN n', param1='value1')
+
+        self.mock_client.execute_query.assert_called_once_with(
+            'MATCH (n) RETURN n',
+            parameters_={},
+            database_='graphiti',
+            param1='value1',
+        )
+        assert result is mock_result
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_execute_query_with_params(self):
+        """Test query execution with explicit params dict.
+
+        Regression test: query parameters (`params`) must stay in
+        `parameters_` (they are real Cypher bind variables), while
+        `database_` must be passed separately as a kwarg -- see
+        `test_execute_query_success` for the full explanation.
+        """
+        mock_result = MagicMock()
+        self.mock_client.execute_query = AsyncMock(return_value=mock_result)
+
+        await self.driver.execute_query(
+            'MATCH (n) WHERE n.uuid = $uuid RETURN n',
+            params={'uuid': 'test-uuid'},
+        )
+
+        self.mock_client.execute_query.assert_called_once_with(
+            'MATCH (n) WHERE n.uuid = $uuid RETURN n',
+            parameters_={'uuid': 'test-uuid'},
+            database_='graphiti',
+        )
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_execute_query_routes_to_cloned_database(self):
+        """Regression test for the cross-tenant leak: a driver obtained via
+        `with_database(tenant_db)` must route execute_query() to that
+        database, not to the original driver's database."""
+        mock_result = MagicMock()
+        self.mock_client.execute_query = AsyncMock(return_value=mock_result)
+
+        tenant_driver = self.driver.with_database('tenant_b')
+        await tenant_driver.execute_query('MATCH (n) RETURN n')
+
+        self.mock_client.execute_query.assert_called_once_with(
+            'MATCH (n) RETURN n',
+            parameters_={},
+            database_='tenant_b',
+        )
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_execute_query_propagates_exceptions(self):
+        """Test that query exceptions are properly propagated."""
+        self.mock_client.execute_query = AsyncMock(side_effect=Exception('Connection refused'))
+
+        with pytest.raises(Exception, match='Connection refused'):
+            await self.driver.execute_query('INVALID QUERY')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_session_creation(self):
+        """The session is opened on the default database and still reaches the client's."""
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
+        mock_session.execute_read = AsyncMock(return_value='rows')
+        self.mock_client.session.return_value = mock_session
+
+        session = self.driver.session()
+
+        self.mock_client.session.assert_called_once_with(database='graphiti')
+        assert await session.execute_read(lambda tx: None) == 'rows'
+        await session.close()
+        mock_session.close.assert_awaited_once()
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_session_creation_with_custom_database(self):
+        """Test session creation with custom database name."""
+        mock_session = MagicMock()
+        self.mock_client.session.return_value = mock_session
+
+        self.driver.session(database='custom_db')
+
+        self.mock_client.session.assert_called_once_with(database='custom_db')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_close(self):
+        """Test driver close method."""
+        self.mock_client.close = AsyncMock()
+
+        await self.driver.close()
+
+        self.mock_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_health_check_success(self):
+        """Test successful health check."""
+        self.mock_client.verify_connectivity = AsyncMock()
+
+        result = await self.driver.health_check()
+
+        self.mock_client.verify_connectivity.assert_called_once()
+        assert result is None
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_health_check_failure(self):
+        """Test health check failure raises exception."""
+        self.mock_client.verify_connectivity = AsyncMock(side_effect=Exception('Cannot connect'))
+
+        with pytest.raises(Exception, match='Cannot connect'):
+            await self.driver.health_check()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_delete_all_indexes_logs_warning(self):
+        """Test delete_all_indexes logs a warning (not supported via Bolt)."""
+        with patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger:
+            await self.driver.delete_all_indexes()
+            mock_logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_build_indices_and_constraints(self):
+        """Test index and constraint building executes queries."""
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._create_types = AsyncMock()
+        self.driver._create_embedding_properties = AsyncMock()
+
+        await self.driver.build_indices_and_constraints()
+
+        # Should have been called multiple times for all index queries
+        assert self.mock_client.execute_query.call_count > 0
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_build_indices_continues_after_a_failed_statement(self):
+        """One failing DDL statement must not stop the remaining ones."""
+        call_count = 0
+
+        async def execute_with_errors(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count % 3 == 0:
+                raise Exception('Index already exists')
+            return MagicMock()
+
+        self.mock_client.execute_query = execute_with_errors
+        self.driver._create_types = AsyncMock()
+        self.driver._create_embedding_properties = AsyncMock()
+
+        await self.driver.build_indices_and_constraints()
+
+        # every statement was attempted despite the failures
+        from graphiti_core.graph_queries import (
+            get_fulltext_indices,
+            get_range_indices,
+            get_vector_indices,
+        )
+
+        expected = (
+            len(get_range_indices(GraphProvider.ARCADEDB))
+            + len(get_fulltext_indices(GraphProvider.ARCADEDB))
+            + len(get_vector_indices(GraphProvider.ARCADEDB))
+        )
+        assert call_count == expected
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_range_indices_use_valid_cypher_syntax(self):
+        """Regression test: get_range_indices(ARCADEDB) previously generated
+        ArcadeDB SQL DDL (`CREATE VERTEX TYPE ... IF NOT EXISTS`,
+        `CREATE INDEX ... NOTUNIQUE`) sent over the Cypher/Bolt channel, which
+        rejects it entirely (verified: all 28 original statements failed with
+        'mismatched input TYPE/ON' syntax errors against a real ArcadeDB
+        instance). Cypher's `CREATE INDEX <name> IF NOT EXISTS FOR (n:Label)
+        ON (n.prop)` syntax is what ArcadeDB's Bolt plugin actually accepts."""
+        from graphiti_core.driver.driver import GraphProvider
+        from graphiti_core.graph_queries import get_range_indices
+
+        indices = get_range_indices(GraphProvider.ARCADEDB)
+
+        assert len(indices) > 0
+        for query in indices:
+            assert 'VERTEX TYPE' not in query
+            assert 'EDGE TYPE' not in query
+            assert 'NOTUNIQUE' not in query
+            assert 'FOR (' in query or 'FOR ()-' in query
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_fulltext_index_names_match_query_names(self):
+        """ArcadeDB addresses a fulltext index by the name given in its DDL, so the
+        name the query builders call must be the name the DDL creates, for nodes and
+        for relationships."""
+        from graphiti_core.graph_queries import (
+            get_fulltext_indices,
+            get_nodes_query,
+            get_relationships_query,
+        )
+
+        statements = get_fulltext_indices(GraphProvider.ARCADEDB)
+        assert len(statements) == 4
+        for statement in statements:
+            assert statement.lstrip().startswith('CREATE FULLTEXT INDEX')
+            assert 'IF NOT EXISTS' in statement
+            # tenant scoping is a Lucene `group_id:` clause, so group_id must be indexed
+            assert 'group_id' in statement
+
+        for name in ('node_name_and_summary', 'community_name', 'episode_content'):
+            assert f'CREATE FULLTEXT INDEX {name} ' in ' '.join(statements)
+            assert f'"{name}"' in get_nodes_query(name, '$query', 10, GraphProvider.ARCADEDB)
+
+        assert 'CREATE FULLTEXT INDEX edge_name_and_fact ' in ' '.join(statements)
+        assert '"edge_name_and_fact"' in get_relationships_query(
+            'edge_name_and_fact', 10, GraphProvider.ARCADEDB
+        )
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_fulltext_query_passes_limit_option(self):
+        """The 3-argument form (ArcadeDB 26.11.1+) lets the engine stop at `limit`."""
+        from graphiti_core.graph_queries import get_nodes_query, get_relationships_query
+
+        assert '{limit: $limit}' in get_nodes_query(
+            'node_name_and_summary', '$query', 10, GraphProvider.ARCADEDB
+        )
+        assert '{limit: $limit}' in get_relationships_query(
+            'edge_name_and_fact', 10, GraphProvider.ARCADEDB
+        )
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_vector_indices(self):
+        from graphiti_core.graph_queries import get_vector_indices
+
+        sized = get_vector_indices(GraphProvider.ARCADEDB, 1024, 'scalar')
+        assert len(sized) == 3  # Entity and Community names, and the RELATES_TO facts
+        assert all('CREATE VECTOR INDEX' in s and 'IF NOT EXISTS' in s for s in sized)
+        assert any('FOR (n:Entity) ON n.name_embedding' in s for s in sized)
+        assert any('FOR (n:Community) ON n.name_embedding' in s for s in sized)
+        assert any('FOR ()-[e:RELATES_TO]-() ON e.fact_embedding' in s for s in sized)
+        assert all('`vector.dimensions`: 1024' in s for s in sized)
+        assert all("`vector.quantization.type`: 'scalar'" in s for s in sized)
+        assert all("`vector.similarity_function`: 'cosine'" in s for s in sized)
+
+        # no dimension -> the index sizes itself from the first vector
+        unsized = get_vector_indices(GraphProvider.ARCADEDB)
+        assert all('vector.dimensions' not in s for s in unsized)
+
+        assert get_vector_indices(GraphProvider.NEO4J, 1024) == []
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_edge_ann_is_only_for_searches_the_relationship_alone_can_answer(self):
+        from graphiti_core.driver.arcadedb.search_queries import edge_ann_applicable
+
+        assert edge_ann_applicable([], None, None)
+        assert edge_ann_applicable(['e.name in $edge_types', 'e.uuid in $edge_uuids'], None, None)
+        # pinned endpoints (the duplicate-detection form) need the MATCH
+        assert not edge_ann_applicable([], 'a', None)
+        assert not edge_ann_applicable([], None, 'b')
+        # filters that read the endpoints, in each form the filter constructor writes them
+        assert not edge_ann_applicable(['n.uuid IN $edge_source_node_uuids'], None, None)
+        assert not edge_ann_applicable(['m.uuid IN $edge_target_node_uuids'], None, None)
+        assert not edge_ann_applicable(
+            ['all(label IN $labels WHERE label IN n.labels)'], None, None
+        )
+        assert not edge_ann_applicable(['n:Person AND m:Person'], None, None)
+
+    @staticmethod
+    def _edge_search_executor(index_missing: bool = False) -> MagicMock:
+        queries: list[str] = []
+
+        async def execute_query(query, **params):
+            queries.append(query)
+            if index_missing and 'queryNodes' in query:
+                raise RuntimeError(
+                    "No vector index found on property 'fact_embedding' for type 'RELATES_TO'"
+                )
+            return ([{'uuid': 'e1'}], None, None)
+
+        executor = MagicMock()
+        executor.use_vector_index = True
+        executor.queries = queries
+        executor.execute_query = AsyncMock(side_effect=execute_query)
+        return executor
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_edge_similarity_uses_the_relationship_index_with_the_group_pushed_in(self):
+        from graphiti_core.driver.arcadedb.operations.search_ops import ArcadeDBSearchOperations
+        from graphiti_core.search.search_filters import SearchFilters
+
+        executor = self._edge_search_executor()
+        with patch(
+            'graphiti_core.driver.arcadedb.operations.search_ops.entity_edge_from_record',
+            side_effect=lambda r: r['uuid'],
+        ):
+            result = await ArcadeDBSearchOperations().edge_similarity_search(
+                executor, [1.0], None, None, SearchFilters(), group_ids=['g1'], limit=10
+            )
+
+        assert result == ['e1']
+        (query,) = executor.queries
+        assert "db.index.vector.queryNodes('RELATES_TO[fact_embedding]'" in query
+        assert "{where: 'group_id IN :group_ids'}" in query
+        assert 'YIELD node AS e, score' in query
+        assert 'MATCH (n:Entity)' not in query  # no scan
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_edge_similarity_stays_exact_when_it_cannot_use_the_index(self):
+        from graphiti_core.driver.arcadedb.operations.search_ops import ArcadeDBSearchOperations
+        from graphiti_core.search.search_filters import SearchFilters
+
+        ops = ArcadeDBSearchOperations()
+        patched = patch(
+            'graphiti_core.driver.arcadedb.operations.search_ops.entity_edge_from_record',
+            side_effect=lambda r: r['uuid'],
+        )
+        with patched:
+            # an endpoint is pinned
+            pinned = self._edge_search_executor()
+            await ops.edge_similarity_search(
+                pinned, [1.0], 'src', None, SearchFilters(), group_ids=['g1']
+            )
+            # the vector index is off
+            off = self._edge_search_executor()
+            off.use_vector_index = False
+            await ops.edge_similarity_search(off, [1.0], None, None, SearchFilters(), ['g1'])
+            # the index does not exist (build_indices_and_constraints has not run)
+            missing = self._edge_search_executor(index_missing=True)
+            await ops.edge_similarity_search(missing, [1.0], None, None, SearchFilters(), ['g1'])
+
+        for executor in (pinned, off):
+            (query,) = executor.queries
+            assert 'queryNodes' not in query
+            assert 'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)' in query
+        # tried the index, then answered exactly
+        assert 'queryNodes' in missing.queries[0]
+        assert 'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)' in missing.queries[1]
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_edge_similarity_endpoint_filters_do_not_depend_on_group_ids(self):
+        from graphiti_core.driver.arcadedb.operations.search_ops import ArcadeDBSearchOperations
+        from graphiti_core.search.search_filters import SearchFilters
+
+        executor = self._edge_search_executor()
+        with patch(
+            'graphiti_core.driver.arcadedb.operations.search_ops.entity_edge_from_record',
+            side_effect=lambda r: r['uuid'],
+        ):
+            await ArcadeDBSearchOperations().edge_similarity_search(
+                executor, [1.0], 'src', 'dst', SearchFilters(), group_ids=None
+            )
+
+        (query,) = executor.queries
+        assert 'n.uuid = $source_uuid' in query
+        assert 'm.uuid = $target_uuid' in query
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_exact_cosine_is_on_the_shared_score_scale(self):
+        """db.index.vector.queryNodes scores (1 + cosine) / 2, like Neo4j's
+        vector.similarity.cosine and FalkorDB; ArcadeDB's own function returns the raw
+        cosine, so min_score would mean something different without the rescale."""
+        from graphiti_core.graph_queries import get_vector_cosine_func_query
+
+        expr = get_vector_cosine_func_query('a', 'b', GraphProvider.ARCADEDB)
+        assert expr == '(1 + vector.similarity.cosine(a, b)) / 2'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_ann_query_group_filter_is_pushed_into_the_index_call(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_query
+
+        query, k = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', filter_queries=[],
+            by_group=True, limit=10,
+        )  # fmt: skip
+        assert "queryNodes('Entity[name_embedding]', $k, $search_vector, " in query
+        assert "{where: 'group_id IN :group_ids'}" in query
+        assert k == 10
+        assert query.count('WHERE') == 1
+
+        query, _ = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', filter_queries=[],
+            by_group=False, limit=10,
+        )  # fmt: skip
+        assert 'where:' not in query
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_ann_query_overfetches_and_joins_filters_with_and(self):
+        """Post-call predicates may discard candidates, so ask the index for more, and
+        they share the single WHERE (a second one is a syntax error)."""
+        from graphiti_core.driver.arcadedb.search_queries import (
+            ARCADEDB_ANN_OVERFETCH,
+            ann_query,
+        )
+
+        query, k = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid',
+            filter_queries=['list_has_all(n.labels, $labels)'], by_group=True, limit=10,
+        )  # fmt: skip
+        assert k == 10 * ARCADEDB_ANN_OVERFETCH
+        assert query.count('WHERE') == 1
+        assert 'WHERE score > $min_score AND list_has_all(n.labels, $labels)' in query
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_falls_back_to_exact_only_when_the_candidate_window_hid_matches(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        def executor_for(candidates: int, lowest: float | None) -> MagicMock:
+            async def execute_query(query, **params):
+                if 'count(score)' in query:
+                    return ([{'candidates': candidates, 'lowest': lowest}], None, None)
+                return ([{'uuid': 'a'}], None, None)
+
+            executor = MagicMock()
+            executor.execute_query = AsyncMock(side_effect=execute_query)
+            return executor
+
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_params={}, group_ids=['g'], limit=10, min_score=0.6,
+        )  # fmt: skip
+        window = 10 * 4  # limit * ARCADEDB_ANN_OVERFETCH
+
+        # no post-filters: fewer rows than limit is a legitimate answer, no second query
+        executor = executor_for(window, 0.9)
+        assert await ann_search(executor, filter_queries=[], **kwargs) == [{'uuid': 'a'}]
+        assert executor.execute_query.await_count == 1
+
+        # filters starved a full window whose weakest candidate still beats min_score:
+        # better ones may sit beyond it -> exact scan
+        assert await ann_search(executor_for(window, 0.8), filter_queries=['x'], **kwargs) is None
+
+        # full window, but min_score already cut it: nothing beyond can score higher
+        assert await ann_search(executor_for(window, 0.5), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
+
+        # window not full: the index (or the tenant) was exhausted, the answer is complete
+        assert await ann_search(executor_for(12, 0.7), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
+        assert await ann_search(executor_for(0, None), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_index_errors_fall_back_but_others_raise(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_queries=[], filter_params={}, group_ids=None, limit=10, min_score=0.6,
+        )  # fmt: skip
+
+        executor = MagicMock()
+        # what ArcadeDB 26.11.1 actually answers with no index (type present) and with no type
+        for message in (
+            "{message: No vector index found on property 'name_embedding' for type 'Entity'}",
+            "{message: Error executing procedure: Type with name 'Entity' was not found}",
+        ):
+            executor.execute_query = AsyncMock(side_effect=Exception(message))
+            assert await ann_search(executor, **kwargs) is None, message
+
+        # the same errors about another label are somebody else's problem
+        for message in (
+            "{message: No vector index found on property 'name_embedding' for type 'Community'}",
+            "{message: Error executing procedure: Type with name 'Community' was not found}",
+        ):
+            executor.execute_query = AsyncMock(side_effect=Exception(message))
+            with pytest.raises(Exception, match='Community'):
+                await ann_search(executor, **kwargs)
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_unknown_vector_quantization_is_rejected(self):
+        with (
+            patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase'),
+            pytest.raises(ValueError, match='vector_quantization'),
+        ):
+            ArcadeDBDriver(uri='bolt://x:7687', user='u', password='p', vector_quantization='x')  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_unrelated_errors_still_raise(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_queries=[], filter_params={}, group_ids=None, limit=10, min_score=0.6,
+        )  # fmt: skip
+        executor = MagicMock()
+
+        executor.execute_query = AsyncMock(side_effect=Exception('connection reset'))
+        with pytest.raises(Exception, match='connection reset'):
+            await ann_search(executor, **kwargs)
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_vector_index_ddl_is_skipped_when_disabled(self):
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._create_types = AsyncMock()
+        self.driver._create_embedding_properties = AsyncMock()
+
+        await self.driver.build_indices_and_constraints()
+        sent = [c.args[0] for c in self.mock_client.execute_query.call_args_list]
+        assert any(q.startswith('CREATE VECTOR INDEX') for q in sent)
+        assert any(q.startswith('CREATE FULLTEXT INDEX') for q in sent)
+
+        self.mock_client.execute_query.reset_mock()
+        self.driver.use_vector_index = False
+        await self.driver.build_indices_and_constraints()
+        sent = [c.args[0] for c in self.mock_client.execute_query.call_args_list]
+        assert not any('VECTOR INDEX' in q for q in sent)
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_types_are_precreated_with_buckets_and_unreachable_http_is_not_fatal(self):
+        import httpx
+
+        posted = []
+
+        async def fake_post(self_, url, json=None, **kwargs):
+            posted.append(json['command'])
+            return httpx.Response(200, request=httpx.Request('POST', url))
+
+        with patch.object(httpx.AsyncClient, 'post', fake_post):
+            await self.driver._create_types()
+        assert 'CREATE VERTEX TYPE Entity IF NOT EXISTS BUCKETS 16' in posted
+        assert 'CREATE EDGE TYPE RELATES_TO IF NOT EXISTS BUCKETS 16' in posted
+
+        # An unreachable HTTP API only costs the bucket count and the embedding property
+        # declarations: indexes still get built.
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._http_uri = 'http://127.0.0.1:1'
+        with patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger:
+            await self.driver.build_indices_and_constraints()
+        warnings = [c.args[0] for c in mock_logger.warning.call_args_list]
+        assert len(warnings) == 2, warnings
+        assert 'pre-create ArcadeDB types' in warnings[0]
+        assert 'declare the ArcadeDB embedding properties' in warnings[1]
+        assert self.mock_client.execute_query.call_count > 0
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_the_embedding_properties_are_declared_as_float_arrays(self):
+        """An undeclared embedding property is stored as a list of boxed doubles, which is
+        what dominates an exact edge-similarity scan: the scan reads every fact's embedding.
+        The property is declared as a float array, and ArcadeDB compacts the list on write."""
+        import httpx
+
+        posted = []
+
+        async def fake_post(self_, url, json=None, **kwargs):
+            posted.append(json['command'])
+            return httpx.Response(200, request=httpx.Request('POST', url))
+
+        with patch.object(httpx.AsyncClient, 'post', fake_post):
+            await self.driver._create_embedding_properties()
+
+        assert 'CREATE PROPERTY Entity.name_embedding IF NOT EXISTS ARRAY_OF_FLOATS' in posted
+        assert 'CREATE PROPERTY Community.name_embedding IF NOT EXISTS ARRAY_OF_FLOATS' in posted
+        assert 'CREATE PROPERTY RELATES_TO.fact_embedding IF NOT EXISTS ARRAY_OF_FLOATS' in posted
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_an_unreachable_http_api_costs_the_embedding_property_declaration(self):
+        """The declaration is best effort: the property is created implicitly on the first
+        write, as before, and only the read of an embedding is slower."""
+        import httpx
+
+        async def fake_post(self_, url, json=None, **kwargs):
+            raise httpx.ConnectError('down')
+
+        with (
+            patch.object(httpx.AsyncClient, 'post', fake_post),
+            patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger,
+        ):
+            await self.driver._create_embedding_properties()
+        mock_logger.warning.assert_called_once()
+        assert 'declare the ArcadeDB embedding properties' in mock_logger.warning.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_provisions_its_database_once_and_the_primary_never_does(self):
+        """Graphiti clones the driver per group_id; those databases exist nowhere else, so
+        the clone creates and indexes its database on first use, once per process even
+        across clones. The database the driver was constructed with is never touched."""
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        order: list[str] = []
+        self.driver._database_exists = AsyncMock(
+            side_effect=lambda db: order.append(f'exists:{db}') or False
+        )
+        self.driver._create_database = AsyncMock(
+            side_effect=lambda db: order.append(f'create:{db}')
+        )
+        self.driver._create_types = AsyncMock(side_effect=lambda: order.append('types'))
+
+        await self.driver.execute_query('RETURN 1')
+        assert order == []
+
+        tenant = self.driver.clone('tenant_a')
+        await tenant.execute_query('RETURN 1')
+        await tenant.execute_query('RETURN 2')
+        await self.driver.clone('tenant_a').execute_query('RETURN 3')
+
+        assert order[:3] == ['exists:tenant_a', 'create:tenant_a', 'types']
+        assert order.count('create:tenant_a') == 1
+        assert self.driver._provisioned == {'graphiti', 'tenant_a'}
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_skips_creating_a_database_that_already_exists(self):
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._database_exists = AsyncMock(return_value=True)
+        self.driver._create_database = AsyncMock()
+        self.driver._create_types = AsyncMock()
+        self.driver._create_embedding_properties = AsyncMock()
+
+        await self.driver.clone('tenant_a').execute_query('RETURN 1')
+
+        self.driver._create_database.assert_not_called()
+        # indexes are still (idempotently) ensured
+        assert self.mock_client.execute_query.call_count > 0
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_rejects_database_names_that_are_not_plain_identifiers(self):
+        with pytest.raises(ValueError, match='Invalid ArcadeDB database name'):
+            await self.driver.clone('bad; drop database graphiti').execute_query('RETURN 1')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_creating_a_tenant_database_without_the_http_api_fails_loudly(self):
+        self.driver._http_uri = 'http://127.0.0.1:1'
+        with pytest.raises(RuntimeError, match='could not be created via the HTTP API'):
+            await self.driver._create_database('tenant_a')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_server_older_than_the_index_fixes_is_warned_about(self):
+        self.driver._http_uri = 'http://arcade.invalid:2480'
+
+        def served(version):
+            response = MagicMock()
+            response.json.return_value = {'version': version}
+            client = MagicMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=response)
+            return client
+
+        for version, warned in (
+            ('26.11.1 (build a3a5d12)', True),
+            ('26.10.2', True),
+            ('26.12.1-SNAPSHOT (build 601600ee)', False),
+            ('27.1.0', False),
+            ('unparseable', False),
+        ):
+            with (
+                patch(
+                    'graphiti_core.driver.arcadedb_driver.httpx.AsyncClient',
+                    return_value=served(version),
+                ),
+                patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger,
+            ):
+                await self.driver._warn_if_server_predates_fixes()
+            assert mock_logger.warning.called is warned, version
+
+        # an unreachable HTTP API is not an error: the check is best effort
+        import httpx
+
+        failing = served('x')
+        failing.get = AsyncMock(side_effect=httpx.ConnectError('down'))
+        with patch('graphiti_core.driver.arcadedb_driver.httpx.AsyncClient', return_value=failing):
+            await self.driver._warn_if_server_predates_fixes()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_server_without_cypher_index_ddl_fails_loudly(self):
+        """ArcadeDB 26.10.x rejects CREATE FULLTEXT / VECTOR INDEX. Swallowing that as a
+        warning left Graphiti running with no search indexes at all."""
+        self.driver._create_types = AsyncMock()
+        self.driver._create_embedding_properties = AsyncMock()
+        old_server = Exception('{message: Only standard, RANGE and TEXT index types are supported}')
+
+        async def execute_query(query, **kwargs):
+            if query.startswith(('CREATE FULLTEXT', 'CREATE VECTOR')):
+                raise old_server
+            return MagicMock()
+
+        self.mock_client.execute_query = AsyncMock(side_effect=execute_query)
+        with pytest.raises(RuntimeError, match='26.11.1 or newer is required'):
+            await self.driver.build_indices_and_constraints()
+
+        # any other failed statement is still only logged, and the build carries on
+        async def flaky(query, **kwargs):
+            if 'relation_uuid' in query:
+                raise Exception('something else went wrong')
+            return MagicMock()
+
+        self.mock_client.execute_query = AsyncMock(side_effect=flaky)
+        with patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger:
+            await self.driver.build_indices_and_constraints()
+        mock_logger.warning.assert_called_once()
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_operations_properties(self):
+        """Test that all 11 operation properties are available."""
+        assert self.driver.entity_node_ops is not None
+        assert self.driver.episode_node_ops is not None
+        assert self.driver.community_node_ops is not None
+        assert self.driver.saga_node_ops is not None
+        assert self.driver.entity_edge_ops is not None
+        assert self.driver.episodic_edge_ops is not None
+        assert self.driver.community_edge_ops is not None
+        assert self.driver.has_episode_edge_ops is not None
+        assert self.driver.next_episode_edge_ops is not None
+        assert self.driver.search_ops is not None
+        assert self.driver.graph_ops is not None
+
+
+class TestArcadeDBTransaction:
+    """Test ArcadeDB transaction functionality."""
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_transaction_commit(self):
+        """Test transaction commits on success."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            driver = ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='test',
+            )
+
+        mock_tx = AsyncMock()
+        mock_session = AsyncMock()
+        mock_session.begin_transaction = AsyncMock(return_value=mock_tx)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        driver.client.session.return_value = mock_session
+
+        async with driver.transaction() as tx:
+            await tx.run('CREATE (n:Test)')
+
+        mock_tx.commit.assert_called_once()
+        mock_tx.rollback.assert_not_called()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_transaction_rollback_on_error(self):
+        """Test transaction rolls back on exception."""
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            driver = ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='test',
+            )
+
+        mock_tx = AsyncMock()
+        mock_session = AsyncMock()
+        mock_session.begin_transaction = AsyncMock(return_value=mock_tx)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        driver.client.session.return_value = mock_session
+
+        with pytest.raises(ValueError, match='test error'):
+            async with driver.transaction():
+                raise ValueError('test error')
+
+        mock_tx.rollback.assert_called_once()
+        mock_tx.commit.assert_not_called()
+
+
+# Simple integration test
+class TestArcadeDBDriverIntegration:
+    """Simple integration test for ArcadeDB driver."""
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_basic_integration_with_real_arcadedb(self):
+        """Basic integration test with real ArcadeDB instance."""
+        arcadedb_uri = os.getenv('ARCADEDB_URI', 'bolt://localhost:7687')
+        arcadedb_user = os.getenv('ARCADEDB_USER', 'root')
+        arcadedb_password = os.getenv('ARCADEDB_PASSWORD', 'playwithdata')
+
+        try:
+            driver = ArcadeDBDriver(
+                uri=arcadedb_uri,
+                user=arcadedb_user,
+                password=arcadedb_password,
+            )
+
+            # Test connectivity
+            await driver.health_check()
+
+            # Test basic query execution
+            result = await driver.execute_query('RETURN 1 as test')
+            assert result is not None
+
+            records, summary, keys = result
+            assert len(records) == 1
+
+            await driver.close()
+
+        except Exception as e:
+            pytest.skip(f'ArcadeDB not available for integration test: {e}')
+
+
+class TestArcadeDBWriteGate:
+    """Concurrent writers of one process are admitted a few at a time, per database."""
+
+    @staticmethod
+    def _driver(write_concurrency: int | None = 1) -> 'ArcadeDBDriver':
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            return ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='x',
+                database='graphiti',
+                write_concurrency=write_concurrency,
+            )
+
+    @staticmethod
+    def _track(driver: 'ArcadeDBDriver') -> dict[str, int]:
+        """Replace the Bolt client; ``peak`` is the most calls ever running at once."""
+        state = {'running': 0, 'peak': 0}
+
+        async def work(*args, **kwargs):
+            state['running'] += 1
+            state['peak'] = max(state['peak'], state['running'])
+            await asyncio.sleep(0.01)
+            state['running'] -= 1
+            return ([], None, [])
+
+        client = MagicMock()
+        client.execute_query = AsyncMock(side_effect=work)
+        session = MagicMock()
+        session.execute_write = AsyncMock(side_effect=work)
+        client.session = MagicMock(return_value=session)
+        driver.client = client
+        return state
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    @pytest.mark.parametrize(('limit', 'expected_peak'), [(1, 1), (3, 3), (None, 8)])
+    async def test_writes_are_admitted_up_to_the_limit(self, limit, expected_peak):
+        driver = self._driver(limit)
+        state = self._track(driver)
+
+        await asyncio.gather(*[driver.execute_query('CREATE (n)') for _ in range(8)])
+        assert state['peak'] == expected_peak
+
+        state['peak'] = 0
+        sessions = [driver.session() for _ in range(8)]
+        await asyncio.gather(*[s.execute_write(lambda tx: None) for s in sessions])
+        assert state['peak'] == expected_peak
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_reads_and_other_databases_are_not_held_up(self):
+        driver = self._driver(1)
+        state = self._track(driver)
+
+        await asyncio.gather(*[driver.execute_query('MATCH (n)', routing_='r') for _ in range(5)])
+        assert state['peak'] == 5
+
+        state['peak'] = 0
+        await asyncio.gather(
+            driver.execute_query('CREATE (n)', database_='tenant_a'),
+            driver.execute_query('CREATE (n)', database_='tenant_b'),
+        )
+        assert state['peak'] == 2
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_write_inside_a_transaction_does_not_wait_for_itself(self):
+        driver = self._driver(1)
+        self._track(driver)
+        tx = MagicMock()
+        tx.commit = AsyncMock()
+        tx.rollback = AsyncMock()
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.begin_transaction = AsyncMock(return_value=tx)
+        driver.client.session = MagicMock(return_value=session)
+
+        async def nested():
+            async with driver.transaction():
+                await driver.execute_query('CREATE (n)')
+
+        await asyncio.wait_for(nested(), timeout=2)
+        tx.commit.assert_awaited_once()
+        # the gate was released: the next writer is admitted
+        await asyncio.wait_for(driver.execute_query('CREATE (n)'), timeout=2)
+
+
+@unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+class TestCompactVectors:
+    """Long float lists reach the Bolt driver as a list whose repr is constant time."""
+
+    def test_long_float_lists_are_replaced_wherever_they_sit(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors, _FloatVector
+
+        vector = [0.5] * 1024
+        params = {
+            'entity_edges': [{'uuid': 'a', 'fact_embedding': vector, 'episodes': ['x']}],
+            'name_embedding': vector,
+            'small': [0.1] * 8,
+            'ids': ['a', 'b'],
+        }
+
+        out = _compact_vectors(params)
+
+        assert isinstance(out['name_embedding'], _FloatVector)
+        assert isinstance(out['entity_edges'][0]['fact_embedding'], _FloatVector)
+        assert out['entity_edges'][0]['fact_embedding'] == vector
+        # short lists, strings and everything else are the caller's own objects
+        assert out['small'] is params['small'] and out['ids'] is params['ids']
+        assert out['entity_edges'][0]['episodes'] is params['entity_edges'][0]['episodes']
+        # the input is never modified
+        assert type(params['name_embedding']) is list
+        assert type(params['entity_edges'][0]['fact_embedding']) is list
+
+    def test_parameters_without_an_embedding_come_back_untouched(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors
+
+        params = {'uuid': 'a', 'rows': [{'n': 1}, {'n': 2}], 'tags': ['x'], 'nothing': None}
+        assert _compact_vectors(params) is params
+        assert _compact_vectors(None) is None
+        assert _compact_vectors([]) == []
+
+    def test_repr_does_not_walk_the_vector(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors
+
+        class Exploding(float):
+            def __repr__(self):
+                raise AssertionError('repr of an element was evaluated')
+
+        vector = _compact_vectors({'v': [Exploding(1.0)] * 64})['v']
+        assert repr(vector) == '<64 floats>'
+        assert ' '.join(map(repr, ({'v': vector},))) == "{'v': <64 floats>}"
+
+    @pytest.mark.asyncio
+    async def test_the_transaction_given_to_execute_write_compacts_its_parameters(self):
+        from graphiti_core.driver.arcadedb_driver import _CompactingTransaction, _FloatVector
+
+        raw = MagicMock()
+        raw.run = AsyncMock(return_value='result')
+        tx = _CompactingTransaction(raw)
+
+        assert await tx.run('Q', embedding=[0.5] * 64, other=1) == 'result'
+        args, kwargs = raw.run.await_args
+        assert args[0] == 'Q'
+        assert isinstance(kwargs['embedding'], _FloatVector) and kwargs['other'] == 1
+
+        await tx.run('Q', {'rows': [{'v': [0.5] * 64}]})
+        assert isinstance(raw.run.await_args.args[1]['rows'][0]['v'], _FloatVector)
+        # anything else is the wrapped transaction's own
+        assert tx.commit is raw.commit

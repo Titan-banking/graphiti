@@ -27,7 +27,7 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
@@ -515,16 +515,32 @@ class Graphiti:
 
         driver = driver or self.driver
 
-        records, _, _ = await driver.execute_query(
-            """
-            MATCH (s:Saga {name: $name, group_id: $group_id})
-            RETURN s.uuid AS uuid, s.name AS name, s.group_id AS group_id, s.created_at AS created_at,
-                   s.first_episode_uuid AS first_episode_uuid, s.last_episode_uuid AS last_episode_uuid
-            """,
-            name=saga_name,
-            group_id=group_id,
-            routing_='r',
-        )
+        if driver.provider == GraphProvider.TIGERGRAPH:
+            # TigerGraph does not run Cypher: a saga is found among the group's sagas
+            sagas = await driver.saga_node_ops.get_by_group_ids(driver, [group_id])  # type: ignore[union-attr]
+            records = [
+                {
+                    'uuid': s.uuid,
+                    'name': s.name,
+                    'group_id': s.group_id,
+                    'created_at': s.created_at,
+                    'first_episode_uuid': s.first_episode_uuid,
+                    'last_episode_uuid': s.last_episode_uuid,
+                }
+                for s in sagas
+                if s.name == saga_name
+            ]
+        else:
+            records, _, _ = await driver.execute_query(
+                """
+                MATCH (s:Saga {name: $name, group_id: $group_id})
+                RETURN s.uuid AS uuid, s.name AS name, s.group_id AS group_id, s.created_at AS created_at,
+                       s.first_episode_uuid AS first_episode_uuid, s.last_episode_uuid AS last_episode_uuid
+                """,
+                name=saga_name,
+                group_id=group_id,
+                routing_='r',
+            )
 
         if records:
             record = records[0]
@@ -2194,6 +2210,14 @@ class Graphiti:
         # We should delete all nodes that are only mentioned in the deleted episode
         nodes_to_delete: list[EntityNode] = []
         for node in nodes:
+            if self.driver.provider == GraphProvider.TIGERGRAPH:
+                mentioned_in = await self.driver.episode_node_ops.get_by_entity_node_uuid(  # type: ignore[union-attr]
+                    self.driver, node.uuid
+                )
+                if len(mentioned_in) == 1:
+                    nodes_to_delete.append(node)
+                continue
+
             query: LiteralString = 'MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN count(*) AS episode_count'
             records, _, _ = await self.driver.execute_query(query, uuid=node.uuid, routing_='r')
 

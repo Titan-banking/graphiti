@@ -61,6 +61,8 @@ class GraphProvider(Enum):
     FALKORDB = 'falkordb'
     KUZU = 'kuzu'
     NEPTUNE = 'neptune'
+    ARCADEDB = 'arcadedb'
+    TIGERGRAPH = 'tigergraph'
 
 
 class GraphDriverSession(ABC):

@@ -68,6 +68,21 @@ if os.getenv('DISABLE_NEPTUNE') is None:
     except ImportError:
         raise
 
+if os.getenv('DISABLE_ARCADEDB') is None:
+    try:
+        from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
+
+        drivers.append(GraphProvider.ARCADEDB)
+    except ImportError:
+        raise
+
+# TigerGraph needs its Community image (an x86 container) and a minute to create its schema: opt in with
+# ENABLE_TIGERGRAPH=1
+if os.getenv('ENABLE_TIGERGRAPH') is not None:
+    from graphiti_core.driver.tigergraph_driver import TigerGraphDriver
+
+    drivers.append(GraphProvider.TIGERGRAPH)
+
 NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'test')
@@ -82,6 +97,21 @@ NEPTUNE_PORT = os.getenv('NEPTUNE_PORT', 8182)
 AOSS_HOST = os.getenv('AOSS_HOST', None)
 
 KUZU_DB = os.getenv('KUZU_DB', ':memory:')
+
+ARCADEDB_URI = os.getenv('ARCADEDB_URI', 'bolt://localhost:7687')
+ARCADEDB_USER = os.getenv('ARCADEDB_USER', 'root')
+ARCADEDB_PASSWORD = os.getenv('ARCADEDB_PASSWORD', 'playwithdata')
+ARCADEDB_DATABASE = os.getenv('ARCADEDB_DATABASE', 'graphiti')
+# HTTP API of the test server (docker-compose.arcadedb.yml maps it to 2481). Never leave
+# this unset: the driver would then fall back to port 2480 of the Bolt host.
+ARCADEDB_HTTP_URI = os.getenv('ARCADEDB_HTTP_URI', 'http://localhost:2481')
+
+TIGERGRAPH_HOST = os.getenv('TIGERGRAPH_HOST', 'localhost')
+TIGERGRAPH_GSQL_PORT = os.getenv('TIGERGRAPH_GSQL_PORT', '14240')
+TIGERGRAPH_RESTPP_PORT = os.getenv('TIGERGRAPH_RESTPP_PORT', '9000')
+TIGERGRAPH_USER = os.getenv('TIGERGRAPH_USER', 'tigergraph')
+TIGERGRAPH_PASSWORD = os.getenv('TIGERGRAPH_PASSWORD', 'tigergraph')
+TIGERGRAPH_GRAPH = os.getenv('TIGERGRAPH_GRAPH', 'graphiti')
 
 group_id = 'graphiti_test_group'
 group_id_2 = 'graphiti_test_group_2'
@@ -111,6 +141,30 @@ def get_driver(provider: GraphProvider) -> GraphDriver:
             host=NEPTUNE_HOST,
             port=int(NEPTUNE_PORT),
             aoss_host=AOSS_HOST,
+        )
+    elif provider == GraphProvider.ARCADEDB:
+        # The shared suites write both 384-dim helper embeddings and the 1024-dim
+        # Graphiti default into one database, which a vector index (fixed dimension)
+        # cannot hold. They run the exact similarity path; the ANN path is covered by
+        # tests/driver/test_arcadedb_driver_int.py.
+        return ArcadeDBDriver(
+            uri=ARCADEDB_URI,
+            user=ARCADEDB_USER,
+            password=ARCADEDB_PASSWORD,
+            database=ARCADEDB_DATABASE,
+            http_uri=ARCADEDB_HTTP_URI,
+            use_vector_index=False,
+        )
+    elif provider == GraphProvider.TIGERGRAPH:
+        # The shared suites write 384-dim helper embeddings; a TigerGraph vector attribute has one dimension.
+        return TigerGraphDriver(
+            host=TIGERGRAPH_HOST,
+            gsql_port=int(TIGERGRAPH_GSQL_PORT),
+            restpp_port=int(TIGERGRAPH_RESTPP_PORT),
+            user=TIGERGRAPH_USER,
+            password=TIGERGRAPH_PASSWORD,
+            graph=TIGERGRAPH_GRAPH,
+            embedding_dim=int(os.getenv('TIGERGRAPH_EMBEDDING_DIM', '384')),
         )
     else:
         raise ValueError(f'Driver {provider} not available')
@@ -198,6 +252,14 @@ def test_lucene_sanitize():
 
 
 async def get_node_count(driver: GraphDriver, uuids: list[str]) -> int:
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        results = await driver.client.interpret(  # type: ignore[attr-defined]
+            'SET<STRING> ids',
+            'S = {Entity.*, Episodic.*, Community.*, Saga.*}; T = SELECT v FROM S:v WHERE v.uuid IN ids;'
+            ' PRINT T.size();',
+            {'ids': uuids},
+        )
+        return int(results[0]['T.size()'])
     results, _, _ = await driver.execute_query(
         """
         MATCH (n)
@@ -210,6 +272,15 @@ async def get_node_count(driver: GraphDriver, uuids: list[str]) -> int:
 
 
 async def get_edge_count(driver: GraphDriver, uuids: list[str]) -> int:
+    if driver.provider == GraphProvider.TIGERGRAPH:
+        results = await driver.client.interpret(  # type: ignore[attr-defined]
+            'SET<STRING> ids',
+            'SumAccum<INT> @@n; S = {Entity.*, Episodic.*, Community.*, Saga.*};'
+            ' R = SELECT t FROM S:s -((RELATES_TO|MENTIONS|HAS_MEMBER|HAS_EPISODE|NEXT_EPISODE):e)-> :t'
+            ' WHERE e.uuid IN ids ACCUM @@n += 1; PRINT @@n;',
+            {'ids': uuids},
+        )
+        return int(results[0]['@@n'])
     results, _, _ = await driver.execute_query(
         """
         MATCH (n)-[e]->(m)
