@@ -345,6 +345,9 @@ def optional_section(title: str, md: str, heading: str) -> str:
 def main() -> None:
     base = Path(sys.argv[1] if len(sys.argv) > 1 else 'benchmarks/results/2026-11-09')
     results = json.loads(base.with_suffix('.json').read_text())
+    # A run may measure only some engines (for example only ArcadeDB): the others are empty columns
+    for column_key, _, _ in COLUMNS:
+        results.setdefault(column_key, {})
     md = base.with_suffix('.md').read_text()
     title = md.split('\n', 1)[0].lstrip('# ').strip()
     sizes = sorted({s for v in results.values() for s in v}, key=int)
