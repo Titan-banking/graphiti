@@ -75,6 +75,14 @@ ARCADEDB_TYPE_BUCKETS = 16
 ARCADEDB_MIN_FIXED_VERSION = (26, 12, 1)
 ARCADEDB_VERTEX_TYPES = ('Entity', 'Episodic', 'Community', 'Saga')
 ARCADEDB_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
+# The types whose group_id is indexed (see get_range_indices) and searched by tenant.
+ARCADEDB_GROUP_ID_TYPES = (
+    *ARCADEDB_VERTEX_TYPES,
+    'RELATES_TO',
+    'MENTIONS',
+    'HAS_EPISODE',
+    'NEXT_EPISODE',
+)
 _DATABASE_NAME = re.compile(r'[A-Za-z0-9_-]+')
 # What ArcadeDB 26.10.x answers to Cypher CREATE FULLTEXT INDEX / CREATE VECTOR INDEX.
 _OLD_SERVER_INDEX_DDL_ERROR = 'Only standard, RANGE and TEXT index types are supported'
@@ -582,16 +590,28 @@ class ArcadeDBDriver(GraphDriver):
         write, so the write path is unchanged. Best-effort: if the HTTP API is unreachable the
         property is created implicitly on the first write, as before, and only the read is
         slower.
+
+        ``group_id`` is declared ``STRING`` as well. The engine answers a vector search scoped
+        to one tenant (``where: 'group_id = :group_id'``) from the ``group_id`` index only when
+        the property is declared: an undeclared one keeps the search walking the graph and
+        loading a record per candidate (128 ms against 9.8 ms for one tenant of 200 facts).
         """
-        statements = [
-            f'CREATE PROPERTY {type_name}.name_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
-            for type_name in ARCADEDB_VERTEX_TYPES
-            if type_name in ('Entity', 'Community')
-        ] + [
-            f'CREATE PROPERTY {type_name}.fact_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
-            for type_name in ARCADEDB_EDGE_TYPES
-            if type_name == 'RELATES_TO'
-        ]
+        statements = (
+            [
+                f'CREATE PROPERTY {type_name}.name_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
+                for type_name in ARCADEDB_VERTEX_TYPES
+                if type_name in ('Entity', 'Community')
+            ]
+            + [
+                f'CREATE PROPERTY {type_name}.fact_embedding IF NOT EXISTS ARRAY_OF_FLOATS'
+                for type_name in ARCADEDB_EDGE_TYPES
+                if type_name == 'RELATES_TO'
+            ]
+            + [
+                f'CREATE PROPERTY {type_name}.group_id IF NOT EXISTS STRING'
+                for type_name in ARCADEDB_GROUP_ID_TYPES
+            ]
+        )
 
         async with httpx.AsyncClient() as client:
             failures: list[str] = []
