@@ -43,6 +43,7 @@ def ann_query(
     filter_queries: list[str],
     by_group: bool,
     limit: int,
+    single_group: bool = False,
     prop: str = 'name_embedding',
 ) -> tuple[LiteralString, int]:
     """Build the ANN similarity query and the ``k`` to request from the index.
@@ -60,12 +61,13 @@ def ann_query(
     so ``alias`` is a node or a relationship of whatever ``return_query`` reads.
 
     Params the query expects: ``search_vector``, ``k``, ``limit``, ``min_score``, plus
-    ``group_ids`` when ``by_group`` and whatever ``filter_queries`` reference.
+    ``group_ids`` when ``by_group`` (``group_id`` instead when ``single_group``: see
+    ``_ann_call``) and whatever ``filter_queries`` reference.
     """
     k = limit * ARCADEDB_ANN_OVERFETCH if filter_queries else limit
     where = ' AND '.join(['score > $min_score', *filter_queries])
     query = (
-        f'{_ann_call(label, by_group, prop)} '
+        f'{_ann_call(label, by_group, prop, single_group)} '
         f'YIELD node AS {alias}, score '
         f'WITH {alias}, score WHERE {where} '
         f'RETURN {return_query} '
@@ -88,21 +90,45 @@ def _vector_index_unavailable(error: Exception, label: str, prop: str = 'name_em
     )
 
 
-def _ann_call(label: str, by_group: bool, prop: str = 'name_embedding') -> str:
-    options = ", {where: 'group_id IN :group_ids'}" if by_group else ''
+def _ann_call(
+    label: str, by_group: bool, prop: str = 'name_embedding', single_group: bool = False
+) -> str:
+    """The index call, with the tenant filter pushed into it.
+
+    One group is sent as an equality (``group_id = :group_id``) and several as ``IN``. The
+    engine answers an equality on an indexed property from that index, listing the tenant's
+    records and scoring just those (3.6 ms against 68 ms for ``IN`` on 150 tenants of 400
+    facts); ``IN`` is evaluated on every candidate the graph walk meets.
+    """
+    if not by_group:
+        options = ''
+    elif single_group:
+        options = ", {where: 'group_id = :group_id'}"
+    else:
+        options = ", {where: 'group_id IN :group_ids'}"
     return (
         f"CALL db.index.vector.queryNodes('{vector_index_name(label, prop)}', $k, "
         f'$search_vector{options})'
     )
 
 
-def ann_window_query(*, label: str, by_group: bool, prop: str = 'name_embedding') -> LiteralString:
+def _group_params(group_ids: list[str] | None) -> dict[str, Any]:
+    if group_ids is None:
+        return {}
+    if len(group_ids) == 1:
+        return {'group_id': group_ids[0]}
+    return {'group_ids': group_ids}
+
+
+def ann_window_query(
+    *, label: str, by_group: bool, prop: str = 'name_embedding', single_group: bool = False
+) -> LiteralString:
     """How many candidates the index returns for ``k`` and how weak the last one is.
 
     Params: ``search_vector``, ``k`` and ``group_ids`` when ``by_group``.
     """
     query = (
-        f'{_ann_call(label, by_group, prop)} YIELD score '
+        f'{_ann_call(label, by_group, prop, single_group)} YIELD score '
         'RETURN count(score) AS candidates, min(score) AS lowest'
     )
     return cast(LiteralString, query)
@@ -161,10 +187,9 @@ async def ann_search(
         by_group=group_ids is not None,
         limit=limit,
         prop=prop,
+        single_group=group_ids is not None and len(group_ids) == 1,
     )
-    params: dict[str, Any] = dict(filter_params)
-    if group_ids is not None:
-        params['group_ids'] = group_ids
+    params: dict[str, Any] = {**filter_params, **_group_params(group_ids)}
 
     try:
         records, _, _ = await executor.execute_query(
@@ -191,11 +216,16 @@ async def ann_search(
         # everything beyond it scores lower. Otherwise the index was exhausted (a small tenant)
         # or min_score ended the list, and the answer is already complete.
         window, _, _ = await executor.execute_query(
-            ann_window_query(label=label, by_group=group_ids is not None, prop=prop),
+            ann_window_query(
+                label=label,
+                by_group=group_ids is not None,
+                prop=prop,
+                single_group=group_ids is not None and len(group_ids) == 1,
+            ),
             search_vector=search_vector,
             k=k,
             routing_='r',
-            **({'group_ids': group_ids} if group_ids is not None else {}),
+            **_group_params(group_ids),
         )
         candidates, lowest = window[0]['candidates'], window[0]['lowest']
         if candidates >= k and lowest > min_score:

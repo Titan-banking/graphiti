@@ -464,9 +464,37 @@ class TestArcadeDBDriver:
         assert result == ['e1']
         (query,) = executor.queries
         assert "db.index.vector.queryNodes('RELATES_TO[fact_embedding]'" in query
-        assert "{where: 'group_id IN :group_ids'}" in query
+        # one group is an equality, which the engine answers from the group_id index
+        assert "{where: 'group_id = :group_id'}" in query
+        assert 'IN :group_ids' not in query
         assert 'YIELD node AS e, score' in query
         assert 'MATCH (n:Entity)' not in query  # no scan
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_sends_one_group_as_an_equality_and_several_as_in(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        async def run(group_ids):
+            executor = MagicMock()
+            executor.execute_query = AsyncMock(return_value=([{'uuid': 'a'}], None, None))
+            await ann_search(
+                executor, label='Entity', alias='n', return_query='n.uuid AS uuid',
+                search_vector=[1.0], filter_queries=[], filter_params={}, group_ids=group_ids,
+                limit=10, min_score=0.6,
+            )  # fmt: skip
+            return executor.execute_query.await_args
+
+        call = await run(['g1'])
+        assert "{where: 'group_id = :group_id'}" in call.args[0]
+        assert call.kwargs['group_id'] == 'g1' and 'group_ids' not in call.kwargs
+
+        call = await run(['g1', 'g2'])
+        assert "{where: 'group_id IN :group_ids'}" in call.args[0]
+        assert call.kwargs['group_ids'] == ['g1', 'g2'] and 'group_id' not in call.kwargs
+
+        call = await run(None)
+        assert 'where' not in call.args[0]
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
