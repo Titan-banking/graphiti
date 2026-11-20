@@ -596,5 +596,20 @@ class DatabaseDriverFactory:
                     'database': database,
                 }
 
+            case 'arcadedb':
+                import os
+
+                from config.schema import ArcadeDBProviderConfig
+
+                arcade_config = config.providers.arcadedb or ArcadeDBProviderConfig()
+                return {
+                    'driver': 'arcadedb',
+                    'uri': os.environ.get('ARCADEDB_URI', arcade_config.uri),
+                    'user': os.environ.get('ARCADEDB_USER', arcade_config.username),
+                    'password': os.environ.get('ARCADEDB_PASSWORD', arcade_config.password),
+                    'database': os.environ.get('ARCADEDB_DATABASE', arcade_config.database),
+                    'http_uri': os.environ.get('ARCADEDB_HTTP_URI', arcade_config.http_uri),
+                }
+
             case _:
                 raise ValueError(f'Unsupported Database provider: {provider}')

@@ -200,11 +200,22 @@ class FalkorDBProviderConfig(BaseModel):
     database: str = 'default_db'
 
 
+class ArcadeDBProviderConfig(BaseModel):
+    """ArcadeDB provider configuration (Bolt protocol)."""
+
+    uri: str = 'bolt://localhost:7687'
+    username: str = 'root'
+    password: str | None = None
+    database: str = 'graphiti'
+    http_uri: str | None = None
+
+
 class DatabaseProvidersConfig(BaseModel):
     """Database providers configuration."""
 
     neo4j: Neo4jProviderConfig | None = None
     falkordb: FalkorDBProviderConfig | None = None
+    arcadedb: ArcadeDBProviderConfig | None = None
 
 
 class DatabaseConfig(BaseModel):

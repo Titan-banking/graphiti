@@ -309,6 +309,25 @@ class GraphitiService:
                         cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
                     )
+                elif self.config.database.provider.lower() == 'arcadedb':
+                    from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
+
+                    arcade_driver = ArcadeDBDriver(
+                        uri=db_config['uri'],
+                        user=db_config['user'],
+                        password=db_config['password'],
+                        database=db_config['database'],
+                        embedding_dim=self.config.embedder.dimensions,
+                        http_uri=db_config['http_uri'] or None,
+                    )
+
+                    self.client = Graphiti(
+                        graph_driver=arcade_driver,
+                        llm_client=llm_client,
+                        embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
+                        max_coroutines=self.semaphore_limit,
+                    )
                 else:
                     raise ValueError(
                         f'Unsupported database provider: {self.config.database.provider}'
@@ -1228,7 +1247,7 @@ async def initialize_server() -> ServerConfig:
     )
     parser.add_argument(
         '--database-provider',
-        choices=['neo4j', 'falkordb'],
+        choices=['neo4j', 'falkordb', 'arcadedb'],
         help='Database provider to use',
     )
 

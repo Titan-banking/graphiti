@@ -74,7 +74,7 @@ embedder:
       model: "voyage-3"
 
 database:
-  provider: "falkordb"  # Default: falkordb. Options: neo4j, falkordb
+  provider: "falkordb"  # Default: falkordb. Options: neo4j, falkordb, arcadedb
 
   providers:
     falkordb:
@@ -88,6 +88,13 @@ database:
       password: ${NEO4J_PASSWORD}
       database: ${NEO4J_DATABASE:neo4j}
       use_parallel_runtime: ${USE_PARALLEL_RUNTIME:false}
+
+    arcadedb:  # Bolt protocol (port 7687)
+      uri: ${ARCADEDB_URI:bolt://localhost:7687}
+      username: ${ARCADEDB_USER:root}
+      password: ${ARCADEDB_PASSWORD}
+      database: ${ARCADEDB_DATABASE:graphiti}
+      http_uri: ${ARCADEDB_HTTP_URI:}  # HTTP API for creating databases; default: Bolt host, port 2480
 
 graphiti:
   group_id: ${GRAPHITI_GROUP_ID:main}
