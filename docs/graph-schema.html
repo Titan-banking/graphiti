@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Graphiti graph schema</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font:15px/1.55 -apple-system,Segoe UI,Helvetica,sans-serif;max-width:1100px;margin:2em auto;padding:0 1.2em;color:#1c2024}
+  h1,h2,h3{line-height:1.25} h2{margin-top:2.2em;border-bottom:1px solid #d9d9e0;padding-bottom:.25em}
+  table{border-collapse:collapse;margin:1em 0;font-size:13.5px;width:100%}
+  th,td{border:1px solid #d9d9e0;padding:5px 9px;text-align:left;vertical-align:top}
+  th{background:#f0f0f3} code{background:#f0f0f3;padding:1px 4px;border-radius:3px;font-size:92%}
+  .note{background:#fff8e1;border-left:4px solid #f5b400;padding:.6em 1em;margin:1em 0}
+  .mermaid{background:#fafafc;border:1px solid #e4e4ea;border-radius:6px;padding:1em;margin:1em 0;text-align:center}
+  nav a{margin-right:1em}
+</style>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({startOnLoad:true, theme:'default'});
+</script>
+</head>
+<body>
+<h1>Graphiti graph schema</h1>
+<p>What Graphiti stores in its graph database: four node types, five edge types, how they connect, and what each is for. Source of truth: <code>graphiti_core/nodes.py</code>, <code>graphiti_core/edges.py</code>. The diagrams load Mermaid from a CDN, so open this page with network access.</p>
+<nav><a href="#overview">Overview</a><a href="#nodes">Nodes</a><a href="#edges">Edges</a><a href="#time">Bi-temporal model</a><a href="#flow">Ingestion flow</a><a href="#search">Search</a><a href="#backends">Backends</a></nav>
+
+<h2 id="overview">1. Overview</h2>
+<p>Graphiti builds a <em>temporal knowledge graph</em> from a stream of <strong>episodes</strong> (messages, text, JSON). An LLM extracts <strong>entities</strong> and the <strong>facts</strong> relating them; the facts are stored as edges that carry validity times, so the graph records both what is true now and what used to be true. Every node and edge has a <code>group_id</code>, the tenant or partition the data belongs to.</p>
+
+<div class="mermaid">
+graph LR
+  Saga((Saga)) -- HAS_EPISODE --> Ep1[Episodic]
+  Ep1 -- NEXT_EPISODE --> Ep2[Episodic]
+  Ep1 -- MENTIONS --> E1((Entity))
+  Ep1 -- MENTIONS --> E2((Entity))
+  E1 -- "RELATES_TO (fact)" --> E2
+  C1{{Community}} -- HAS_MEMBER --> E1
+  C1 -- HAS_MEMBER --> E2
+  C1 -. "hierarchy" .-> C2{{Community}}
+</div>
+
+<table>
+<tr><th>Node</th><th>Role in one line</th></tr>
+<tr><td><code>Entity</code></td><td>A thing the conversation is about: a person, place, product, concept.</td></tr>
+<tr><td><code>Episodic</code></td><td>One unit of raw input (a message, a document, a JSON record); the provenance of everything extracted from it.</td></tr>
+<tr><td><code>Community</code></td><td>A cluster of closely connected entities with an LLM-written summary.</td></tr>
+<tr><td><code>Saga</code></td><td>An ordered thread of related episodes (a conversation or document series) that can be summarised incrementally.</td></tr>
+</table>
+<table>
+<tr><th>Edge</th><th>From &rarr; to</th><th>Role in one line</th></tr>
+<tr><td><code>RELATES_TO</code></td><td>Entity &rarr; Entity</td><td>A <em>fact</em>: a natural-language statement with validity times and an embedding.</td></tr>
+<tr><td><code>MENTIONS</code></td><td>Episodic &rarr; Entity</td><td>This episode referred to this entity.</td></tr>
+<tr><td><code>HAS_MEMBER</code></td><td>Community &rarr; Entity (or Community)</td><td>Community membership.</td></tr>
+<tr><td><code>HAS_EPISODE</code></td><td>Saga &rarr; Episodic</td><td>This episode belongs to the saga.</td></tr>
+<tr><td><code>NEXT_EPISODE</code></td><td>Episodic &rarr; Episodic</td><td>Order of episodes inside a saga.</td></tr>
+</table>
+
+<h2 id="nodes">2. Node types</h2>
+<h3>Common to all nodes (<code>Node</code>)</h3>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>uuid</code></td><td>string</td><td>Primary key; a random UUID4 unless supplied.</td></tr>
+<tr><td><code>name</code></td><td>string</td><td>Display name (entity name, episode name, community name, saga name).</td></tr>
+<tr><td><code>group_id</code></td><td>string</td><td>Partition of the graph. Search and bulk operations are scoped by it; some backends map it to a database or graph per group.</td></tr>
+<tr><td><code>labels</code></td><td>list&lt;string&gt;</td><td>Extra labels. Labels must be safe identifiers (letters, digits, underscore).</td></tr>
+<tr><td><code>created_at</code></td><td>datetime</td><td>When the node was created (ingestion time, UTC).</td></tr>
+</table>
+
+<h3>Entity</h3>
+<p><strong>Used for:</strong> the nouns of the knowledge graph. Entities are deduplicated across episodes (by name similarity, embedding and LLM resolution) so that "Alice", "Alice Smith" and "she" converge on one node. An entity always carries the label <code>Entity</code>; an optional user-defined type (for example <code>Person</code>, <code>Company</code>) is added as a second label and its custom fields land in <code>attributes</code>.</p>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>name_embedding</code></td><td>list&lt;float&gt; | null</td><td>Vector of the name; used for similarity search and for deduplication.</td></tr>
+<tr><td><code>summary</code></td><td>string</td><td>LLM-written summary of what the graph knows about the entity, refreshed as new episodes arrive.</td></tr>
+<tr><td><code>attributes</code></td><td>map</td><td>Free-form fields from custom entity types. Stored as flattened properties on most backends and as one JSON string on Kuzu and TigerGraph.</td></tr>
+</table>
+
+<h3>Episodic</h3>
+<p><strong>Used for:</strong> provenance. Each call to <code>add_episode</code> stores the raw input as an episode, then links it to every entity extracted from it. Episodes give "where did this fact come from" and supply the context window (the last <em>n</em> episodes) for later extraction. They are also searchable by fulltext.</p>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>source</code></td><td>enum <code>message</code> | <code>json</code> | <code>text</code></td><td>Kind of input and how it is parsed. <code>message</code> content is "actor: text".</td></tr>
+<tr><td><code>source_description</code></td><td>string</td><td>Free-text description of where the data came from.</td></tr>
+<tr><td><code>content</code></td><td>string</td><td>The raw episode body.</td></tr>
+<tr><td><code>valid_at</code></td><td>datetime</td><td>When the described events happened (the episode's reference time), as opposed to <code>created_at</code>, when it was ingested.</td></tr>
+<tr><td><code>entity_edges</code></td><td>list&lt;string&gt;</td><td>uuids of the <code>RELATES_TO</code> facts extracted from this episode.</td></tr>
+<tr><td><code>episode_metadata</code></td><td>map | null</td><td>Customer-defined key/values for filtering.</td></tr>
+</table>
+
+<h3>Community</h3>
+<p><strong>Used for:</strong> a coarse, high-level view. A label-propagation pass over the entity graph groups densely connected entities; an LLM summarises each group. Communities answer broad questions ("what is going on around project X") and are searched by name and summary. They are built on demand (<code>build_communities</code>) and updated incrementally with <code>update_communities</code>.</p>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>name_embedding</code></td><td>list&lt;float&gt; | null</td><td>Vector of the community name.</td></tr>
+<tr><td><code>summary</code></td><td>string</td><td>LLM summary of the member entities; larger communities are summarised by merging child summaries pairwise.</td></tr>
+</table>
+
+<h3>Saga</h3>
+<p><strong>Used for:</strong> grouping episodes that form one narrative, such as a chat thread or the chapters of a document, so that their story can be summarised incrementally. <code>add_episode(..., saga='name')</code> finds or creates the saga for the <code>group_id</code>, links the episode with <code>HAS_EPISODE</code> and chains it to the previous one with <code>NEXT_EPISODE</code>. <code>summarize_saga</code> then summarises only episodes added since the last summary.</p>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>summary</code></td><td>string</td><td>Running summary of the saga.</td></tr>
+<tr><td><code>first_episode_uuid</code>, <code>last_episode_uuid</code></td><td>string | null</td><td>Ends of the episode chain.</td></tr>
+<tr><td><code>last_summarized_at</code></td><td>datetime | null</td><td>Ingestion-time watermark: the next summary takes episodes with <code>created_at</code> after this.</td></tr>
+<tr><td><code>last_summarized_episode_valid_at</code></td><td>datetime | null</td><td>Event-time watermark: the latest <code>valid_at</code> covered by the current summary.</td></tr>
+</table>
+<p>Not persisted: four in-memory counters (<code>_summary_episodes_*</code>) describing the last summarise run.</p>
+
+<h2 id="edges">3. Edge types</h2>
+<h3>Common to all edges (<code>Edge</code>)</h3>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>uuid</code></td><td>string</td><td>Edge key. Several edges may join the same pair of nodes, so it is what tells them apart.</td></tr>
+<tr><td><code>group_id</code></td><td>string</td><td>Partition.</td></tr>
+<tr><td><code>source_node_uuid</code>, <code>target_node_uuid</code></td><td>string</td><td>Endpoints.</td></tr>
+<tr><td><code>created_at</code></td><td>datetime</td><td>Ingestion time.</td></tr>
+</table>
+
+<h3>RELATES_TO (EntityEdge): the fact</h3>
+<p><strong>Used for:</strong> the knowledge itself. A fact such as "Alice works at Acme" is one edge from <code>Alice</code> to <code>Acme</code>. Contradicting facts are not overwritten; the older edge is invalidated and the newer one added, so history is preserved. Two entities can have many facts between them.</p>
+<table>
+<tr><th>Property</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>name</code></td><td>string</td><td>The relation type in SCREAMING_SNAKE_CASE (<code>WORKS_AT</code>). The special name <code>IS_DUPLICATE_OF</code> marks a detected duplicate entity pair.</td></tr>
+<tr><td><code>fact</code></td><td>string</td><td>The statement in natural language; fulltext-searched.</td></tr>
+<tr><td><code>fact_embedding</code></td><td>list&lt;float&gt; | null</td><td>Vector of <code>fact</code>; similarity search, and finding facts that a new fact may contradict.</td></tr>
+<tr><td><code>episodes</code></td><td>list&lt;string&gt;</td><td>uuids of the episodes that support the fact.</td></tr>
+<tr><td><code>valid_at</code></td><td>datetime | null</td><td>When the fact became true.</td></tr>
+<tr><td><code>invalid_at</code></td><td>datetime | null</td><td>When it stopped being true in the world.</td></tr>
+<tr><td><code>expired_at</code></td><td>datetime | null</td><td>When Graphiti learned it was superseded (system time).</td></tr>
+<tr><td><code>reference_time</code></td><td>datetime | null</td><td>Reference time of the episode that produced the edge.</td></tr>
+<tr><td><code>attributes</code></td><td>map</td><td>Free-form fields from custom edge types.</td></tr>
+</table>
+
+<h3>MENTIONS (EpisodicEdge)</h3>
+<p>Episodic &rarr; Entity. No properties beyond the common ones. Answers "which episodes talk about this entity", drives the <em>episode-mentions</em> reranker (entities mentioned in more episodes rank higher), and is followed by BFS search so a search can start from an episode.</p>
+
+<h3>HAS_MEMBER (CommunityEdge)</h3>
+<p>Community &rarr; Entity, or Community &rarr; Community when communities are nested. No extra properties. Used to find the community of an entity and to list a community's members.</p>
+
+<h3>HAS_EPISODE (HasEpisodeEdge)</h3>
+<p>Saga &rarr; Episodic. No extra properties. Lists a saga's episodes.</p>
+
+<h3>NEXT_EPISODE (NextEpisodeEdge)</h3>
+<p>Episodic &rarr; Episodic. No extra properties. Records the order of episodes within a saga (previous &rarr; next).</p>
+
+<h3>Entity relationship diagram</h3>
+<div class="mermaid">
+erDiagram
+  ENTITY {
+    string uuid PK
+    string name
+    string group_id
+    string_list labels
+    datetime created_at
+    float_list name_embedding
+    string summary
+    map attributes
+  }
+  EPISODIC {
+    string uuid PK
+    string name
+    string group_id
+    datetime created_at
+    enum source
+    string source_description
+    string content
+    datetime valid_at
+    string_list entity_edges
+    map episode_metadata
+  }
+  COMMUNITY {
+    string uuid PK
+    string name
+    string group_id
+    datetime created_at
+    float_list name_embedding
+    string summary
+  }
+  SAGA {
+    string uuid PK
+    string name
+    string group_id
+    datetime created_at
+    string summary
+    string first_episode_uuid
+    string last_episode_uuid
+    datetime last_summarized_at
+    datetime last_summarized_episode_valid_at
+  }
+  ENTITY ||--o{ ENTITY : "RELATES_TO (fact, name, fact_embedding, valid_at, invalid_at, expired_at, episodes)"
+  EPISODIC }o--o{ ENTITY : MENTIONS
+  COMMUNITY }o--o{ ENTITY : HAS_MEMBER
+  COMMUNITY }o--o{ COMMUNITY : HAS_MEMBER
+  SAGA ||--o{ EPISODIC : HAS_EPISODE
+  EPISODIC |o--o| EPISODIC : NEXT_EPISODE
+</div>
+
+<h2 id="time">4. The bi-temporal model on facts</h2>
+<p>A fact has two timelines. <strong>Event time</strong> (<code>valid_at</code>, <code>invalid_at</code>) says when it was true in the world. <strong>System time</strong> (<code>created_at</code>, <code>expired_at</code>) says when Graphiti recorded it and when it learned it was no longer current. A fact is <em>currently valid</em> when <code>expired_at</code> and <code>invalid_at</code> are null.</p>
+<div class="mermaid">
+timeline
+  title "Alice works at Acme" then "Alice works at Beta"
+  2020-01 : fact 1 valid_at (Alice joins Acme)
+  2023-06 : fact 2 valid_at (Alice joins Beta)
+          : fact 1 invalid_at
+  2023-07 : episode ingested, fact 2 created_at
+          : fact 1 expired_at
+</div>
+<div class="note">Searches filter on these four fields (<code>SearchFilters.valid_at / invalid_at / created_at / expired_at</code>), so "what was true in March" and "what is true now" are the same query with different filters. Backends without a NULL (TigerGraph) store an absent time as an empty value, and the driver treats it as null.</div>
+
+<h2 id="flow">5. How an episode becomes graph</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant App
+  participant G as Graphiti
+  participant LLM
+  participant DB as Graph DB
+  App->>G: add_episode(content, group_id, saga?)
+  G->>DB: load recent episodes (context)
+  G->>DB: save Episodic node
+  G->>LLM: extract entities
+  G->>DB: search similar Entity nodes
+  G->>LLM: resolve duplicates, write summaries
+  G->>LLM: extract facts between entities
+  G->>DB: find similar existing facts
+  G->>LLM: dedupe facts, find contradictions
+  Note over G: contradicted facts get invalid_at and expired_at
+  G->>DB: save Entity nodes, RELATES_TO and MENTIONS edges (bulk)
+  opt saga given
+    G->>DB: HAS_EPISODE and NEXT_EPISODE edges
+  end
+  opt update_communities
+    G->>DB: update Community nodes and HAS_MEMBER edges
+  end
+</div>
+
+<h2 id="search">6. What is searchable</h2>
+<table>
+<tr><th>Target</th><th>Fulltext on</th><th>Vector on</th><th>Graph traversal</th><th>Rerankers</th></tr>
+<tr><td>Entity</td><td><code>name</code>, <code>summary</code></td><td><code>name_embedding</code></td><td>BFS over <code>RELATES_TO</code> / <code>MENTIONS</code>, directed from the origin</td><td>RRF, MMR, cross-encoder, node distance (to a centre node), episode mentions</td></tr>
+<tr><td>RELATES_TO fact</td><td><code>fact</code>, <code>name</code></td><td><code>fact_embedding</code></td><td>BFS, edges met on the walk</td><td>same</td></tr>
+<tr><td>Episodic</td><td><code>content</code>, <code>source_description</code>, <code>name</code></td><td>none</td><td>n/a</td><td>RRF</td></tr>
+<tr><td>Community</td><td><code>name</code>, <code>summary</code></td><td><code>name_embedding</code></td><td>n/a</td><td>RRF, MMR</td></tr>
+</table>
+<p>The default hybrid search runs fulltext, vector and BFS legs, fuses them with reciprocal-rank fusion and optionally reranks. Similarity scores are scaled to (1 + cosine) / 2 on every backend, so the default minimum score 0.6 means the same thing everywhere.</p>
+
+<h2 id="backends">7. How the schema is stored per backend</h2>
+<table>
+<tr><th>Concept</th><th>Neo4j / FalkorDB / ArcadeDB</th><th>Kuzu</th><th>TigerGraph</th></tr>
+<tr><td>Nodes</td><td>Labelled nodes <code>Entity</code>, <code>Episodic</code>, <code>Community</code>, <code>Saga</code></td><td>Node tables</td><td>Vertex types keyed by <code>uuid</code></td></tr>
+<tr><td>Facts</td><td>Relationship <code>RELATES_TO</code> with properties</td><td>A <code>RelatesToNode_</code> node between two <code>RELATES_TO</code> relationships</td><td>Edge type <code>RELATES_TO</code> with <code>DISCRIMINATOR(uuid)</code>, so parallel facts coexist</td></tr>
+<tr><td>Partitioning by <code>group_id</code></td><td>Neo4j: property; FalkorDB: graph per group; ArcadeDB: database per group</td><td>property</td><td>one graph, <code>group_id</code> attribute</td></tr>
+<tr><td>Vectors</td><td>Property (ArcadeDB: HNSW index optional)</td><td>float array</td><td>Vector attribute on Entity and Community (one fixed dimension per schema); <code>fact_embedding</code> is a plain list scanned exactly</td></tr>
+<tr><td>Datetimes</td><td>native</td><td>native</td><td>fixed-width UTC strings (TigerGraph keeps seconds only)</td></tr>
+<tr><td>Free-form <code>attributes</code></td><td>flattened properties</td><td>JSON string</td><td>JSON string</td></tr>
+</table>
+<p>Backend-specific details: <code>graphiti_core/driver/tigergraph/README.md</code> and <code>graphiti_core/driver/arcadedb_driver.py</code>. The generic persistence contract is the set of operation interfaces in <code>graphiti_core/driver/operations/</code>, one per node and edge type plus search and maintenance.</p>
+</body>
+</html>
